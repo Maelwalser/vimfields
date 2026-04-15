@@ -1,0 +1,91 @@
+/* ==========================================================================
+   Vimfields — DOM overlay styles
+   Block cursor, status bar, visual selection, measurement helpers.
+   ========================================================================== */
+
+/* ---------- Block Cursor ---------- */
+
+.vimfields-block-cursor {
+  position: fixed;
+  pointer-events: none;
+  z-index: 2147483647;
+  background: currentColor;
+  mix-blend-mode: difference;
+  border-radius: 1px;
+  transition: left 50ms ease-out, top 50ms ease-out;
+}
+
+.vimfields-block-cursor[data-mode="visual"] {
+  background: Highlight;
+  opacity: 0.4;
+  mix-blend-mode: normal;
+}
+
+/* ---------- Status Bar ---------- */
+
+.vimfields-status-bar {
+  position: fixed;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 8px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #e0e0e0;
+  background: rgba(30, 30, 30, 0.85);
+  border-radius: 4px;
+  pointer-events: none;
+  user-select: none;
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  white-space: nowrap;
+}
+
+.vimfields-status-bar[data-mode="insert"] {
+  color: #a8db8f;
+}
+
+.vimfields-status-bar[data-mode="visual"] {
+  color: #c4a6f5;
+}
+
+.vimfields-status-mode {
+  font-weight: 600;
+}
+
+.vimfields-status-buffer {
+  color: #888;
+}
+
+/* ---------- Visual Mode Selection Highlight ---------- */
+
+.vimfields-visual-highlight {
+  position: absolute;
+  pointer-events: none;
+  background: Highlight;
+  opacity: 0.3;
+  z-index: 2147483646;
+}
+
+/* ---------- Measurement Helpers ---------- */
+
+.vimfields-measure {
+  position: absolute !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+  white-space: pre !important;
+}
+
+/* ---------- Reduced Motion ---------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .vimfields-block-cursor {
+    transition: none;
+  }
+
+  .vimfields-status-bar {
+    transition: none;
+  }
+}
