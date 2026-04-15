@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit",
     "watch": "node esbuild.config.mjs --watch",
     "test": "vitest run",
+    "test:watch": "vitest",
     "test:dom": "vitest run tests/dom/"
   },
   "devDependencies": {
