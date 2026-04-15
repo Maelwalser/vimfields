@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "VimFields",
+  "version": "0.1.0",
+  "description": "Vim keybindings for text fields in the browser",
+  "permissions": ["activeTab", "storage", "clipboardWrite"],
+  "background": {
+    "service_worker": "dist/src/background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["dist/src/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "commands": {
+    "toggle-vimfields": {
+      "suggested_key": {
+        "default": "Alt+V"
+      },
+      "description": "Toggle VimFields on/off"
+    }
+  }
+}

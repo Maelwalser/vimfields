@@ -1,0 +1,4 @@
+.phantom/
+node_modules/
+dist/
+*.js.map

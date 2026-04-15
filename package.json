@@ -3,15 +3,20 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "description": "Vim keybindings for text fields in the browser",
   "scripts": {
-    "build": "tsc --noEmit",
+    "build": "node esbuild.config.mjs",
+    "typecheck": "tsc --noEmit",
+    "watch": "node esbuild.config.mjs --watch",
     "test": "vitest run",
     "test:dom": "vitest run tests/dom/"
   },
   "devDependencies": {
-    "typescript": "^5.7.0",
-    "vitest": "^3.1.0",
+    "@types/chrome": "^0.0.287",
+    "@vitest/coverage-v8": "^3.1.0",
+    "esbuild": "^0.24.0",
     "jsdom": "^26.0.0",
-    "@vitest/coverage-v8": "^3.1.0"
+    "typescript": "^5.7.0",
+    "vitest": "^3.1.0"
   }
 }

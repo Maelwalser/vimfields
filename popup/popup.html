@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VimFields Settings</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="popup">
+    <header class="header">
+      <h1 class="title">VimFields</h1>
+      <label class="toggle">
+        <input type="checkbox" id="enabled-toggle" checked>
+        <span class="toggle-slider"></span>
+      </label>
+    </header>
+
+    <section class="section">
+      <label class="field-label" for="escape-remap">
+        Escape remap
+        <span class="field-hint">Key sequence to exit insert mode</span>
+      </label>
+      <input type="text" id="escape-remap" class="input" placeholder="jk" maxlength="4">
+    </section>
+
+    <section class="section">
+      <label class="field-label" for="disabled-sites">
+        Disabled sites
+        <span class="field-hint">One domain per line</span>
+      </label>
+      <textarea id="disabled-sites" class="textarea" rows="4" placeholder="example.com&#10;mail.google.com"></textarea>
+    </section>
+
+    <footer class="footer">
+      <span id="status" class="status"></span>
+    </footer>
+  </div>
+
+  <script src="../dist/popup/popup.js" type="module"></script>
+</body>
+</html>
