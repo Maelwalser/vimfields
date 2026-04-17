@@ -1,5 +1,6 @@
 import { TextEdit, Command, RegisterContent } from './types.js';
-import { executeMotion } from './motions.js';
+import { executeMotion, applyMotionRepeated, EXCLUSIVE_MOTIONS } from './motions.js';
+import { textObjectRange } from './text-objects.js';
 import { Registers } from './registers.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────
@@ -25,8 +26,8 @@ function fullLineRange(text: string, pos: number): [number, number] {
 // ─── Range calculation ───────────────────────────────────────────
 
 /**
- * Compute the [start, end) range for a motion-based operator.
- * `end` is exclusive for character-wise motions.
+ * Compute the [start, end) range for a motion-based or text-object operator.
+ * The third tuple element indicates whether the range is linewise.
  */
 function motionRange(
   text: string,
@@ -45,19 +46,28 @@ function motionRange(
     return [start, end, true];
   }
 
-  // Motion-based range
-  let target = cursor;
-  for (let i = 0; i < cmd.count; i++) {
-    target = executeMotion(cmd.motion!, text, target, cmd.charArg);
+  // Text object: range comes directly from the text-object module.
+  if (cmd.textObject) {
+    const range = textObjectRange(cmd.textObject.kind, cmd.textObject.around, text, cursor);
+    if (!range) return [cursor, cursor, false];
+    return [range[0], range[1], false];
   }
+
+  // Motion-based range
+  const target = applyMotionRepeated(
+    cmd.motion!, text, cursor, cmd.count, cmd.charArg, cmd.isCharMotionRepeat ?? false,
+  );
 
   const start = Math.min(cursor, target);
   const rawEnd = Math.max(cursor, target);
 
-  // Exclusive motions (w, b, 0): range is [start, target)
-  // Inclusive motions (e, $, f, t, G, gg): range is [start, target]
-  const exclusiveMotions = new Set(['w', 'b', '0']);
-  const end = exclusiveMotions.has(cmd.motion!) ? rawEnd : rawEnd + 1;
+  // For "w" specifically when used with an operator, Vim shrinks the range
+  // to NOT include trailing whitespace on the final word (well-known dw
+  // behaviour). The word motion already lands on the start of the next
+  // word past whitespace, so we just back up past the whitespace.
+  // For other exclusive motions: range is [start, target).
+  // For inclusive motions (e, $, f, t, F, T, G, gg, %): range is [start, target].
+  const end = EXCLUSIVE_MOTIONS.has(cmd.motion!) ? rawEnd : rawEnd + 1;
   return [start, end, false];
 }
 
@@ -306,4 +316,82 @@ export function changeSelection(
 ): TextEdit {
   const edit = deleteSelection(text, start, end, linewise, registers, register);
   return { ...edit, enterInsert: true };
+}
+
+// ─── Case-change operators ───────────────────────────────────────
+
+type CaseMode = 'lower' | 'upper' | 'toggle';
+
+function applyCase(s: string, mode: CaseMode): string {
+  switch (mode) {
+    case 'lower': return s.toLowerCase();
+    case 'upper': return s.toUpperCase();
+    case 'toggle': {
+      let out = '';
+      for (const ch of s) {
+        const low = ch.toLowerCase();
+        out += ch === low ? ch.toUpperCase() : low;
+      }
+      return out;
+    }
+  }
+}
+
+/** gu / gU / g~ — change case over a motion or text-object range. */
+export function caseOp(
+  text: string,
+  cursor: number,
+  cmd: Command,
+  mode: CaseMode,
+): TextEdit {
+  const [start, end] = motionRange(text, cursor, cmd);
+  if (start === end) return { text, cursor };
+  const newText = text.slice(0, start) + applyCase(text.slice(start, end), mode) + text.slice(end);
+  return { text: newText, cursor: start };
+}
+
+/** ~ — toggle case of the single character under the cursor, then advance. */
+export function toggleCaseChar(text: string, cursor: number, count: number): TextEdit {
+  if (text.length === 0 || cursor >= text.length) return { text, cursor };
+  const end = Math.min(cursor + count, text.length);
+  const newText = text.slice(0, cursor) + applyCase(text.slice(cursor, end), 'toggle') + text.slice(end);
+  return { text: newText, cursor: Math.min(end, newText.length > 0 ? newText.length - 1 : 0) };
+}
+
+/** X — delete character BEFORE the cursor (the inverse of x). */
+export function deleteCharBefore(
+  text: string,
+  cursor: number,
+  count: number,
+  registers: Registers,
+  register?: string,
+): TextEdit {
+  if (cursor === 0) return { text, cursor };
+  const start = Math.max(0, cursor - count);
+  const deleted = text.slice(start, cursor);
+  registers.recordDelete(deleted, false, register);
+  const newText = text.slice(0, start) + text.slice(cursor);
+  return { text: newText, cursor: start };
+}
+
+/** Apply case change directly to a visual selection. */
+export function caseSelection(
+  text: string,
+  start: number,
+  end: number,
+  linewise: boolean,
+  mode: CaseMode,
+): TextEdit {
+  let s: number;
+  let e: number;
+  if (linewise) {
+    [s, e] = fullLineRange(text, Math.min(start, end));
+    const [, endLine] = fullLineRange(text, Math.max(start, end));
+    e = endLine;
+  } else {
+    s = Math.min(start, end);
+    e = Math.max(start, end) + 1;
+  }
+  const newText = text.slice(0, s) + applyCase(text.slice(s, e), mode) + text.slice(e);
+  return { text: newText, cursor: s };
 }

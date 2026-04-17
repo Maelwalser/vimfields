@@ -62,14 +62,35 @@ export class CursorRenderer {
   private adapter: TextAdapter | null = null;
   private selectionRange: { start: number; end: number } | null = null;
   private animFrameId: number | null = null;
+  private originalCaretColor: string | null = null;
 
   private readonly onScrollOrResize = (): void => this.update();
+  private readonly onFieldMutation = (): void => this.update();
+  private readonly onSelectionChange = (): void => {
+    // Only re-render if the active selection belongs to our attached field.
+    // Otherwise selection events from elsewhere cause unnecessary churn.
+    if (!this.adapter) return;
+    const active = document.activeElement;
+    if (active === this.adapter.element || this.adapter.element.contains(active)) {
+      this.update();
+    }
+  };
 
   /** Attach cursor rendering to a field via its TextAdapter. */
   attach(adapter: TextAdapter): void {
     this.adapter = adapter;
     this.createCursorEl();
-    adapter.element.addEventListener('scroll', this.onScrollOrResize, true);
+
+    // Hide the native blinking caret — our overlay replaces it.
+    const el = adapter.element;
+    this.originalCaretColor = el.style.caretColor;
+    el.style.caretColor = 'transparent';
+
+    el.addEventListener('scroll', this.onScrollOrResize, true);
+    el.addEventListener('input', this.onFieldMutation);
+    el.addEventListener('keyup', this.onFieldMutation);
+    el.addEventListener('mouseup', this.onFieldMutation);
+    document.addEventListener('selectionchange', this.onSelectionChange);
     window.addEventListener('scroll', this.onScrollOrResize, true);
     window.addEventListener('resize', this.onScrollOrResize);
     this.update();
@@ -77,8 +98,17 @@ export class CursorRenderer {
 
   detach(): void {
     if (this.adapter) {
-      this.adapter.element.removeEventListener('scroll', this.onScrollOrResize, true);
+      const el = this.adapter.element;
+      // Restore the original caret color (empty string clears our inline override).
+      el.style.caretColor = this.originalCaretColor ?? '';
+      this.originalCaretColor = null;
+
+      el.removeEventListener('scroll', this.onScrollOrResize, true);
+      el.removeEventListener('input', this.onFieldMutation);
+      el.removeEventListener('keyup', this.onFieldMutation);
+      el.removeEventListener('mouseup', this.onFieldMutation);
     }
+    document.removeEventListener('selectionchange', this.onSelectionChange);
     window.removeEventListener('scroll', this.onScrollOrResize, true);
     window.removeEventListener('resize', this.onScrollOrResize);
 
@@ -131,12 +161,6 @@ export class CursorRenderer {
   private render(): void {
     if (!this.cursorEl || !this.adapter) return;
 
-    if (this.mode === 'insert') {
-      this.cursorEl.style.display = 'none';
-      this.clearSelectionEls();
-      return;
-    }
-
     // Draw selection first (behind the cursor).
     if (this.mode === 'visual' && this.selectionRange) {
       this.renderSelection();
@@ -144,7 +168,8 @@ export class CursorRenderer {
       this.clearSelectionEls();
     }
 
-    const caret = this.getCaretGeometry(this.adapter.getCursorPosition());
+    const pos = this.adapter.getCursorPosition();
+    const caret = this.getCaretGeometry(pos);
     if (!caret || !this.isWithinField(caret)) {
       this.cursorEl.style.display = 'none';
       return;
@@ -153,9 +178,46 @@ export class CursorRenderer {
     this.cursorEl.style.display = 'block';
     this.cursorEl.style.left = `${caret.x}px`;
     this.cursorEl.style.top = `${caret.y}px`;
-    this.cursorEl.style.width = `${caret.charWidth}px`;
     this.cursorEl.style.height = `${caret.height}px`;
     this.cursorEl.dataset.mode = this.mode;
+
+    if (this.mode === 'insert') {
+      // Thin blinking I-beam. Animation lives in the stylesheet.
+      this.cursorEl.style.width = '2px';
+      this.cursorEl.textContent = '';
+    } else {
+      // Opaque block. Render the character under the cursor inside the
+      // overlay so it stays readable against the solid background.
+      this.cursorEl.style.width = `${caret.charWidth}px`;
+      this.syncFontToField(caret.height);
+      const text = this.adapter.getText();
+      const ch = pos < text.length ? text[pos] : '';
+      this.cursorEl.textContent = ch && ch !== '\n' ? ch : '';
+    }
+  }
+
+  /**
+   * Copy every font/line-box property from the field so the glyph rendered
+   * inside the overlay lands at the same baseline as the underlying text.
+   * We pin line-height to the measured caret height (a pixel number) because
+   * `getComputedStyle(...).lineHeight` can return the keyword "normal" in
+   * some engines, which we cannot reliably feed back through `style`.
+   */
+  private syncFontToField(caretHeight: number): void {
+    if (!this.cursorEl || !this.adapter) return;
+    const cs = window.getComputedStyle(this.adapter.element);
+    const style = this.cursorEl.style;
+    style.fontFamily = cs.fontFamily;
+    style.fontSize = cs.fontSize;
+    style.fontWeight = cs.fontWeight;
+    style.fontStyle = cs.fontStyle;
+    style.fontVariant = cs.fontVariant;
+    style.fontStretch = cs.fontStretch;
+    style.letterSpacing = cs.letterSpacing;
+    style.wordSpacing = cs.wordSpacing;
+    style.textTransform = cs.textTransform;
+    style.textIndent = '0';
+    style.lineHeight = `${caretHeight}px`;
   }
 
   private renderSelection(): void {

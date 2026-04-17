@@ -290,6 +290,245 @@ describe('CommandParser', () => {
     });
   });
 
+  describe('text objects', () => {
+    it('parses ciw', () => {
+      parser.feed('c');
+      parser.feed('i');
+      const result = parser.feed('w');
+      expect(result).toEqual({
+        status: 'complete',
+        command: {
+          count: 1, operator: 'c', motion: null, linewise: false,
+          textObject: { kind: 'w', around: false },
+        },
+      });
+    });
+
+    it('parses daw', () => {
+      parser.feed('d');
+      parser.feed('a');
+      const result = parser.feed('w');
+      expect(result).toEqual({
+        status: 'complete',
+        command: {
+          count: 1, operator: 'd', motion: null, linewise: false,
+          textObject: { kind: 'w', around: true },
+        },
+      });
+    });
+
+    it('parses di"', () => {
+      parser.feed('d');
+      parser.feed('i');
+      const result = parser.feed('"');
+      expect(result).toEqual({
+        status: 'complete',
+        command: {
+          count: 1, operator: 'd', motion: null, linewise: false,
+          textObject: { kind: '"', around: false },
+        },
+      });
+    });
+
+    it('parses ci(', () => {
+      parser.feed('c');
+      parser.feed('i');
+      const result = parser.feed('(');
+      expect(result).toEqual({
+        status: 'complete',
+        command: {
+          count: 1, operator: 'c', motion: null, linewise: false,
+          textObject: { kind: '(', around: false },
+        },
+      });
+    });
+
+    it('parses yiB (yank inner braces)', () => {
+      parser.feed('y');
+      parser.feed('i');
+      const result = parser.feed('B');
+      expect(result).toEqual({
+        status: 'complete',
+        command: {
+          count: 1, operator: 'y', motion: null, linewise: false,
+          textObject: { kind: 'B', around: false },
+        },
+      });
+    });
+
+    it('ia without a valid object char is invalid', () => {
+      parser.feed('d');
+      parser.feed('i');
+      const result = parser.feed('z');
+      expect(result).toEqual({ status: 'invalid' });
+    });
+  });
+
+  describe('backward char-seek and repeat', () => {
+    it('parses F{char}', () => {
+      expect(parser.feed('F')).toEqual({ status: 'pending' });
+      const result = parser.feed('x');
+      expect(result).toEqual({
+        status: 'complete',
+        command: { count: 1, operator: null, motion: 'F', charArg: 'x', linewise: false },
+      });
+    });
+
+    it('parses ; as a motion', () => {
+      const result = parser.feed(';');
+      expect(result).toEqual({
+        status: 'complete',
+        command: { count: 1, operator: null, motion: ';', linewise: false },
+      });
+    });
+
+    it('parses , as a motion', () => {
+      const result = parser.feed(',');
+      expect(result).toEqual({
+        status: 'complete',
+        command: { count: 1, operator: null, motion: ',', linewise: false },
+      });
+    });
+  });
+
+  describe('WORD motions and extras', () => {
+    it('parses W', () => {
+      expect(parser.feed('W')).toMatchObject({ status: 'complete' });
+    });
+
+    it('parses ^', () => {
+      const result = parser.feed('^');
+      expect(result).toEqual({
+        status: 'complete',
+        command: { count: 1, operator: null, motion: '^', linewise: false },
+      });
+    });
+
+    it('parses %', () => {
+      const result = parser.feed('%');
+      expect(result).toEqual({
+        status: 'complete',
+        command: { count: 1, operator: null, motion: '%', linewise: false },
+      });
+    });
+
+    it('parses ge', () => {
+      parser.feed('g');
+      const result = parser.feed('e');
+      expect(result).toEqual({
+        status: 'complete',
+        command: { count: 1, operator: null, motion: 'ge', linewise: false },
+      });
+    });
+  });
+
+  describe('case-change operators', () => {
+    it('parses guw', () => {
+      parser.feed('g');
+      parser.feed('u');
+      const result = parser.feed('w');
+      expect(result).toEqual({
+        status: 'complete',
+        command: { count: 1, operator: 'gu', motion: 'w', linewise: false },
+      });
+    });
+
+    it('parses gUiw (uppercase inner word)', () => {
+      parser.feed('g');
+      parser.feed('U');
+      parser.feed('i');
+      const result = parser.feed('w');
+      expect(result).toEqual({
+        status: 'complete',
+        command: {
+          count: 1, operator: 'gU', motion: null, linewise: false,
+          textObject: { kind: 'w', around: false },
+        },
+      });
+    });
+
+    it('parses g~w (toggle case over word)', () => {
+      parser.feed('g');
+      parser.feed('~');
+      const result = parser.feed('w');
+      expect(result).toEqual({
+        status: 'complete',
+        command: { count: 1, operator: 'g~', motion: 'w', linewise: false },
+      });
+    });
+
+    it('parses guu (lowercase current line)', () => {
+      parser.feed('g');
+      parser.feed('u');
+      const result = parser.feed('u');
+      expect(result).toEqual({
+        status: 'complete',
+        command: { count: 1, operator: 'gu', motion: null, linewise: true },
+      });
+    });
+
+    it('parses gUU (uppercase current line)', () => {
+      parser.feed('g');
+      parser.feed('U');
+      const result = parser.feed('U');
+      expect(result).toEqual({
+        status: 'complete',
+        command: { count: 1, operator: 'gU', motion: null, linewise: true },
+      });
+    });
+
+    it('parses g~~ (toggle case current line)', () => {
+      parser.feed('g');
+      parser.feed('~');
+      const result = parser.feed('~');
+      expect(result).toEqual({
+        status: 'complete',
+        command: { count: 1, operator: 'g~', motion: null, linewise: true },
+      });
+    });
+
+    it('parses 2gUU (uppercase 2 lines)', () => {
+      parser.feed('2');
+      parser.feed('g');
+      parser.feed('U');
+      const result = parser.feed('U');
+      expect(result).toEqual({
+        status: 'complete',
+        command: { count: 2, operator: 'gU', motion: null, linewise: true },
+      });
+    });
+  });
+
+  describe('new single-key actions', () => {
+    it('parses D', () => {
+      expect(parser.feed('D')).toEqual({ status: 'action', action: 'D', count: 1 });
+    });
+
+    it('parses C', () => {
+      expect(parser.feed('C')).toEqual({ status: 'action', action: 'C', count: 1 });
+    });
+
+    it('parses Y', () => {
+      expect(parser.feed('Y')).toEqual({ status: 'action', action: 'Y', count: 1 });
+    });
+
+    it('parses s', () => {
+      expect(parser.feed('s')).toEqual({ status: 'action', action: 's', count: 1 });
+    });
+
+    it('parses S', () => {
+      expect(parser.feed('S')).toEqual({ status: 'action', action: 'S', count: 1 });
+    });
+
+    it('parses X', () => {
+      expect(parser.feed('X')).toEqual({ status: 'action', action: 'X', count: 1 });
+    });
+
+    it('parses ~', () => {
+      expect(parser.feed('~')).toEqual({ status: 'action', action: '~', count: 1 });
+    });
+  });
+
   describe('reset', () => {
     it('clears the buffer', () => {
       parser.feed('d');

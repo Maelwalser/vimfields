@@ -135,17 +135,35 @@ function getInlineStyles(): string {
   position: fixed;
   pointer-events: none;
   z-index: 2147483646;
-  box-sizing: border-box;
-  background: rgba(120, 170, 255, 0.42);
-  border: 1px solid rgba(120, 170, 255, 0.9);
+  box-sizing: content-box;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: rgb(120, 170, 255);
+  color: #0b1220;
   border-radius: 1px;
+  overflow: hidden;
+  white-space: pre;
+  text-align: left;
+  text-indent: 0;
+  vertical-align: baseline;
   transition: left 40ms linear, top 40ms linear,
               width 40ms linear, height 40ms linear;
 }
 
 .vimfields-block-cursor[data-mode="visual"] {
-  background: rgba(196, 166, 245, 0.55);
-  border-color: rgba(196, 166, 245, 0.95);
+  background: rgb(196, 166, 245);
+  color: #1a0b2e;
+}
+
+.vimfields-block-cursor[data-mode="insert"] {
+  color: transparent;
+  animation: vimfields-cursor-blink 1.06s steps(2, end) infinite;
+}
+
+@keyframes vimfields-cursor-blink {
+  from { opacity: 1; }
+  to { opacity: 0; }
 }
 
 /* Visual-mode selection highlight */
@@ -218,6 +236,7 @@ function getInlineStyles(): string {
 @media (prefers-reduced-motion: reduce) {
   .vimfields-block-cursor {
     transition: none;
+    animation: none;
   }
 }
 `;

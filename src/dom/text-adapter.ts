@@ -237,6 +237,106 @@ export class TextareaAdapter implements TextAdapter {
 // ContentEditableAdapter — contenteditable elements using Selection/Range API
 // ---------------------------------------------------------------------------
 
+// Tags that introduce line breaks in the "plain text" view, matching how
+// innerText treats block-level boundaries. Rich-text editors (ProseMirror,
+// Lexical, Draft, Slate) render Shift+Enter as a <br> or a split <p>/<div>,
+// so we treat both as real newlines in our offset space.
+const BLOCK_TAGS = new Set([
+  'ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'DETAILS', 'DIALOG',
+  'DD', 'DIV', 'DL', 'DT', 'FIELDSET', 'FIGCAPTION', 'FIGURE',
+  'FOOTER', 'FORM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HEADER',
+  'HGROUP', 'HR', 'LI', 'MAIN', 'NAV', 'OL', 'P', 'PRE', 'SECTION',
+  'TABLE', 'TBODY', 'TD', 'TFOOT', 'TH', 'THEAD', 'TR', 'UL',
+]);
+
+function isBlockElement(el: Element): boolean {
+  if (BLOCK_TAGS.has(el.tagName)) return true;
+  try {
+    const display = window.getComputedStyle(el).display;
+    if (!display) return false;
+    return (
+      display === 'block' ||
+      display === 'list-item' ||
+      display === 'flow-root' ||
+      display === 'table' ||
+      display.startsWith('table-') ||
+      display.startsWith('flex') ||
+      display.startsWith('grid')
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Build a plain-text view of a contenteditable subtree, along with the
+ * starting offset of each Text node in that view.
+ *
+ * This mirrors the subset of `innerText` behavior we care about:
+ *   • <br> contributes a single '\n'
+ *   • Block-level element boundaries insert a '\n' between siblings
+ *     (so <p>a</p><p>b</p> becomes "a\nb")
+ *
+ * Keeping getText() and the offset math backed by the same walker is what
+ * makes j/k work across Shift+Enter: both sides agree that the newline
+ * exists and sits at the same offset.
+ */
+function computeTextView(root: Element): {
+  text: string;
+  textNodes: Array<{ node: Text; start: number }>;
+} {
+  const textNodes: Array<{ node: Text; start: number }> = [];
+  let text = '';
+  let pendingNewline = false;
+  let emittedAny = false;
+
+  const flushPending = (): void => {
+    if (pendingNewline) {
+      text += '\n';
+      pendingNewline = false;
+    }
+  };
+
+  const visit = (node: Node): void => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const content = (node as Text).textContent ?? '';
+      if (content.length === 0) return;
+      flushPending();
+      textNodes.push({ node: node as Text, start: text.length });
+      text += content;
+      emittedAny = true;
+      return;
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+    const el = node as Element;
+    if (el.tagName === 'BR') {
+      flushPending();
+      text += '\n';
+      emittedAny = true;
+      return;
+    }
+
+    const treatAsBlock = el !== root && isBlockElement(el);
+
+    if (treatAsBlock && emittedAny) {
+      pendingNewline = true;
+    }
+
+    for (const child of Array.from(el.childNodes)) {
+      visit(child);
+    }
+
+    if (treatAsBlock && emittedAny) {
+      pendingNewline = true;
+    }
+  };
+
+  visit(root);
+  return { text, textNodes };
+}
+
 export class ContentEditableAdapter implements TextAdapter {
   readonly element: HTMLElement;
 
@@ -245,14 +345,14 @@ export class ContentEditableAdapter implements TextAdapter {
   }
 
   getText(): string {
-    return this.element.innerText ?? '';
+    return computeTextView(this.element).text;
   }
 
   setText(text: string): void {
     // For framework editors (Lexical, ProseMirror, Draft, Slate) that listen
     // to beforeinput/input to drive their internal model, execCommand
     // ('insertText') fires the native event pipeline so the editor stays in
-    // sync. Requires focus; if anything fails we fall back to innerText.
+    // sync. Requires focus; if anything fails we rebuild the DOM by hand.
     const active = document.activeElement as Node | null;
     const isFocused =
       active === this.element ||
@@ -271,11 +371,26 @@ export class ContentEditableAdapter implements TextAdapter {
           }
         }
       } catch {
-        // fall through to innerText
+        // fall through to manual DOM rebuild
       }
     }
 
-    this.element.innerText = text;
+    // Rebuild as text nodes separated by <br>. innerText's setter would do
+    // this in a real browser, but jsdom's is a no-op — doing it explicitly
+    // keeps our round-trip consistent with computeTextView() in both.
+    while (this.element.firstChild) {
+      this.element.removeChild(this.element.firstChild);
+    }
+    const doc = this.element.ownerDocument;
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) {
+        this.element.appendChild(doc.createElement('br'));
+      }
+      if (lines[i].length > 0) {
+        this.element.appendChild(doc.createTextNode(lines[i]));
+      }
+    }
     dispatchInputEvents(this.element, text);
   }
 
@@ -361,54 +476,168 @@ export class ContentEditableAdapter implements TextAdapter {
   // ---- Private helpers for Selection/Range <-> offset conversion ----
 
   /**
-   * Walk all text nodes under this.element in DOM order,
-   * converting a Selection range endpoint to a linear character offset.
+   * Walk the subtree, accumulating the same offset that computeTextView()
+   * produces, until we reach the Selection endpoint. This keeps cursor
+   * coordinates aligned with getText() across <br>s and block boundaries,
+   * which is what Shift+Enter produces in Claude/Gemini-style editors.
    */
   private rangeToOffset(range: Range, useStart: boolean): number {
     const targetNode = useStart ? range.startContainer : range.endContainer;
     const targetOffset = useStart ? range.startOffset : range.endOffset;
+    const root = this.element;
 
-    let charCount = 0;
-    const walker = document.createTreeWalker(this.element, NodeFilter.SHOW_TEXT);
-    let node: Text | null;
-
-    while ((node = walker.nextNode() as Text | null)) {
-      if (node === targetNode) {
-        return charCount + targetOffset;
+    // Degenerate case: selection is anchored directly on the contenteditable.
+    if (targetNode === root) {
+      const { text, textNodes } = computeTextView(root);
+      if (targetOffset <= 0) return 0;
+      if (targetOffset >= root.childNodes.length) return text.length;
+      // Find the offset at the boundary just before child[targetOffset].
+      const child = root.childNodes[targetOffset];
+      for (const entry of textNodes) {
+        if (child.contains(entry.node) || child === entry.node) {
+          return entry.start;
+        }
       }
-      charCount += node.textContent?.length ?? 0;
+      return text.length;
     }
 
-    // targetNode might be the element itself (e.g. empty contenteditable)
-    if (targetNode === this.element) {
-      return targetOffset === 0 ? 0 : this.getText().length;
-    }
+    let offset = 0;
+    let emittedAny = false;
+    let pendingNewline = false;
+    let stopped = false;
+    let stoppedAt = 0;
 
-    return charCount;
+    const flushPending = (): void => {
+      if (pendingNewline) {
+        offset += 1;
+        pendingNewline = false;
+      }
+    };
+
+    const visit = (node: Node): void => {
+      if (stopped) return;
+
+      if (node.nodeType === Node.TEXT_NODE) {
+        const content = (node as Text).textContent ?? '';
+        if (node === targetNode) {
+          flushPending();
+          const clampedTargetOffset = Math.max(
+            0,
+            Math.min(targetOffset, content.length),
+          );
+          if (clampedTargetOffset > 0) {
+            offset += clampedTargetOffset;
+            emittedAny = true;
+          }
+          stoppedAt = offset;
+          stopped = true;
+          return;
+        }
+        if (content.length === 0) return;
+        flushPending();
+        offset += content.length;
+        emittedAny = true;
+        return;
+      }
+
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+      const el = node as Element;
+      if (el.tagName === 'BR') {
+        if (node === targetNode) {
+          if (targetOffset <= 0) {
+            flushPending();
+          } else {
+            flushPending();
+            offset += 1;
+            emittedAny = true;
+          }
+          stoppedAt = offset;
+          stopped = true;
+          return;
+        }
+        flushPending();
+        offset += 1;
+        emittedAny = true;
+        return;
+      }
+
+      const treatAsBlock = el !== root && isBlockElement(el);
+
+      if (treatAsBlock && emittedAny) {
+        pendingNewline = true;
+      }
+
+      const children = Array.from(el.childNodes);
+      for (let i = 0; i < children.length; i++) {
+        if (node === targetNode && i === targetOffset) {
+          flushPending();
+          stoppedAt = offset;
+          stopped = true;
+          return;
+        }
+        visit(children[i]);
+        if (stopped) return;
+      }
+
+      if (node === targetNode && targetOffset === children.length) {
+        flushPending();
+        stoppedAt = offset;
+        stopped = true;
+        return;
+      }
+
+      if (treatAsBlock && emittedAny) {
+        pendingNewline = true;
+      }
+    };
+
+    visit(root);
+    return stopped ? stoppedAt : offset;
   }
 
   /**
-   * Convert a linear character offset to a { node, offset } pair
-   * suitable for Range.setStart / Range.setEnd.
+   * Convert a linear character offset (in the same coord space as getText())
+   * to a { node, offset } pair suitable for Range.setStart / Range.setEnd.
    */
   private offsetToNodePosition(offset: number): { node: Node; offset: number } {
-    const text = this.getText();
-    const clampedOffset = Math.max(0, Math.min(offset, text.length));
+    const root = this.element;
+    const { text, textNodes } = computeTextView(root);
+    const clamped = Math.max(0, Math.min(offset, text.length));
 
-    const walker = document.createTreeWalker(this.element, NodeFilter.SHOW_TEXT);
-    let charCount = 0;
-    let node: Text | null;
-
-    while ((node = walker.nextNode() as Text | null)) {
-      const len = node.textContent?.length ?? 0;
-      if (charCount + len >= clampedOffset) {
-        return { node, offset: clampedOffset - charCount };
+    // Prefer placing the cursor inside a text node so framework editors
+    // (ProseMirror/Lexical) treat the selection as a "real" text position.
+    for (let i = 0; i < textNodes.length; i++) {
+      const entry = textNodes[i];
+      const end = entry.start + (entry.node.textContent?.length ?? 0);
+      if (clamped < end) {
+        if (clamped >= entry.start) {
+          return { node: entry.node, offset: clamped - entry.start };
+        }
+        // The offset sits in a synthetic newline gap before this text node.
+        // Land at the start of this node so the cursor appears on the new line.
+        return { node: entry.node, offset: 0 };
       }
-      charCount += len;
+      if (clamped === end) {
+        // Boundary: if the next node's start == clamped (no newline gap),
+        // setting {next, 0} and {current, len} are both valid. Prefer the
+        // current node's end for stability.
+        if (i + 1 < textNodes.length && textNodes[i + 1].start === clamped) {
+          return { node: entry.node, offset: clamped - entry.start };
+        }
+        return { node: entry.node, offset: clamped - entry.start };
+      }
     }
 
-    // Fallback: element itself (e.g. empty contenteditable)
-    return { node: this.element, offset: 0 };
+    // No text nodes at all, or offset past the last text node.
+    if (textNodes.length > 0) {
+      const last = textNodes[textNodes.length - 1];
+      return {
+        node: last.node,
+        offset: last.node.textContent?.length ?? 0,
+      };
+    }
+    return { node: root, offset: 0 };
   }
 }
 

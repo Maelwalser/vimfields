@@ -15,13 +15,16 @@ import { isHostDisabled } from './dom/site-matcher';
 import { ModeManager } from './vim/mode-manager';
 import { VimMode as VimModeEnum } from './vim/types';
 import { CommandParser, type ParseResult } from './vim/command-parser';
-import { executeMotion } from './vim/motions';
+import { executeMotion, applyMotionRepeated } from './vim/motions';
+import { textObjectRange } from './vim/text-objects';
 import { Registers } from './vim/registers';
 import {
   deleteOp, changeOp, yankOp, deleteChar, replaceChar,
   pasteAfter, pasteBefore, joinLines,
   deleteSelection, yankSelection, changeSelection,
+  caseOp, toggleCaseChar, deleteCharBefore, caseSelection,
 } from './vim/operators';
+import type { Command } from './vim/types';
 
 // ── State ──────────────────────────────────────────────────────────
 
@@ -157,6 +160,25 @@ async function doPaste(after: boolean): Promise<void> {
 // ── Visual mode motion buffer ──────────────────────────────────────
 
 let visualBuffer = '';
+
+// ── Last f/F/t/T — for ; and , repeat ──────────────────────────────
+
+let lastCharMotion: { motion: 'f' | 'F' | 't' | 'T'; char: string } | null = null;
+
+/** Invert an f/F/t/T pair (used by `,`). */
+function invertCharMotion(m: 'f' | 'F' | 't' | 'T'): 'f' | 'F' | 't' | 'T' {
+  return ({ f: 'F', F: 'f', t: 'T', T: 't' } as const)[m];
+}
+
+/**
+ * Resolve `;` / `,` against the stored last f/F/t/T, producing the actual
+ * motion+char to execute. Returns null if there is no prior motion.
+ */
+function resolveCharRepeat(key: ';' | ','): { motion: string; char: string } | null {
+  if (!lastCharMotion) return null;
+  const motion = key === ';' ? lastCharMotion.motion : invertCharMotion(lastCharMotion.motion);
+  return { motion, char: lastCharMotion.char };
+}
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -375,6 +397,22 @@ function handleVisualKey(key: string): void {
     return;
   }
 
+  // g-prefixed case-change operators on the selection: gu / gU / g~
+  // (The `g` was consumed into visualBuffer on the previous keystroke.)
+  if (visualBuffer === 'g' && (key === 'u' || key === 'U' || key === '~')) {
+    const text = activeAdapter.getText();
+    const cursor = activeAdapter.getCursorPosition();
+    const isLinewise = modeManager.mode === VimModeEnum.VisualLine;
+    pushUndo(activeElement, text);
+    const mode = key === 'u' ? 'lower' : key === 'U' ? 'upper' : 'toggle';
+    const edit = caseSelection(text, visualAnchor, cursor, isLinewise, mode);
+    activeAdapter.setText(edit.text);
+    activeAdapter.setCursorPosition(Math.min(visualAnchor, cursor));
+    visualBuffer = '';
+    exitVisualMode();
+    return;
+  }
+
   // Operators and non-motion keys are only accepted when no motion is in progress
   if (visualBuffer === '') {
     const text = activeAdapter.getText();
@@ -384,7 +422,8 @@ function handleVisualKey(key: string): void {
     switch (key) {
       case 'd':
       case 'x':
-      case 'X': {
+      case 'X':
+      case 'D': {
         pushUndo(activeElement, text);
         const edit = deleteSelection(text, visualAnchor, cursor, isLinewise, registers);
         activeAdapter.setText(edit.text);
@@ -392,7 +431,8 @@ function handleVisualKey(key: string): void {
         exitVisualMode();
         return;
       }
-      case 'y': {
+      case 'y':
+      case 'Y': {
         yankSelection(text, visualAnchor, cursor, isLinewise, registers);
         copyToClipboard(registers.get('"').text);
         activeAdapter.setCursorPosition(Math.min(visualAnchor, cursor));
@@ -400,7 +440,9 @@ function handleVisualKey(key: string): void {
         return;
       }
       case 'c':
-      case 's': {
+      case 'C':
+      case 's':
+      case 'S': {
         pushUndo(activeElement, text);
         const edit = changeSelection(text, visualAnchor, cursor, isLinewise, registers);
         activeAdapter.setText(edit.text);
@@ -408,6 +450,17 @@ function handleVisualKey(key: string): void {
         modeManager.enterInsert();
         updateModeUI();
         cursorRenderer.clearSelection();
+        return;
+      }
+      case 'u':
+      case 'U':
+      case '~': {
+        pushUndo(activeElement, text);
+        const mode = key === 'u' ? 'lower' : key === 'U' ? 'upper' : 'toggle';
+        const edit = caseSelection(text, visualAnchor, cursor, isLinewise, mode);
+        activeAdapter.setText(edit.text);
+        activeAdapter.setCursorPosition(Math.min(visualAnchor, cursor));
+        exitVisualMode();
         return;
       }
       case 'o': {
@@ -441,44 +494,59 @@ function handleVisualKey(key: string): void {
     }
   }
 
-  // Anything else is a motion, possibly with a count
+  // Anything else is a motion or text object, possibly with a count
   visualBuffer += key;
   statusBar.setCommandBuffer(visualBuffer);
 
   const text = activeAdapter.getText();
   const cursor = activeAdapter.getCursorPosition();
-  const motion = parseVisualMotion(visualBuffer, text, cursor);
+  const parsed = parseVisualMotion(visualBuffer, text, cursor);
 
-  if (motion === 'pending') return;
+  if (parsed === 'pending') return;
 
-  if (motion === 'invalid') {
+  if (parsed === 'invalid') {
     visualBuffer = '';
     statusBar.setCommandBuffer('');
     return;
   }
 
-  activeAdapter.setCursorPosition(motion);
+  if (parsed.kind === 'cursor') {
+    activeAdapter.setCursorPosition(parsed.value);
+  } else {
+    // Text object: snap the selection to [start, end-1] and treat the far
+    // side as the active cursor end.
+    visualAnchor = parsed.start;
+    activeAdapter.setCursorPosition(Math.max(parsed.start, parsed.end - 1));
+  }
+
   updateVisualSelection();
   visualBuffer = '';
   statusBar.setCommandBuffer('');
 }
 
-type MotionResult = number | 'pending' | 'invalid';
+type VisualParseResult =
+  | 'pending'
+  | 'invalid'
+  | { kind: 'cursor'; value: number }
+  | { kind: 'range'; start: number; end: number };
 
-const VISUAL_MOTIONS = new Set(['h', 'j', 'k', 'l', 'w', 'b', 'e', '$', 'G']);
+const VISUAL_MOTIONS = new Set([
+  'h', 'j', 'k', 'l',
+  'w', 'b', 'e', 'W', 'B', 'E',
+  '$', '^', '%', 'G',
+  ';', ',',
+]);
 
-function parseVisualMotion(buf: string, text: string, cursor: number): MotionResult {
+function parseVisualMotion(buf: string, text: string, cursor: number): VisualParseResult {
   let i = 0;
 
-  // Count prefix — but "0" alone is the line-start motion
+  // Count prefix — "0" alone is the line-start motion
   let countStr = '';
   while (i < buf.length && buf[i] >= '1' && buf[i] <= '9') {
     countStr += buf[i];
     i++;
   }
-  while (
-    countStr && i < buf.length && buf[i] >= '0' && buf[i] <= '9'
-  ) {
+  while (countStr && i < buf.length && buf[i] >= '0' && buf[i] <= '9') {
     countStr += buf[i];
     i++;
   }
@@ -488,28 +556,51 @@ function parseVisualMotion(buf: string, text: string, cursor: number): MotionRes
 
   const key = buf[i];
 
-  // Line-start motion (only when no count prefix consumed)
+  // 0 as line-start motion when not consumed as count
   if (key === '0' && !countStr) {
-    return applyMotionNTimes('0', text, cursor, count);
+    return { kind: 'cursor', value: applyMotionNTimes('0', text, cursor, count) };
   }
 
-  // gg — document start
+  // Text object: i{x} / a{x}
+  if (key === 'i' || key === 'a') {
+    if (i + 1 >= buf.length) return 'pending';
+    const range = textObjectRange(buf[i + 1], key === 'a', text, cursor);
+    if (!range) return 'invalid';
+    return { kind: 'range', start: range[0], end: range[1] };
+  }
+
+  // g-prefixed: gg, ge, gE
   if (key === 'g') {
     if (i + 1 >= buf.length) return 'pending';
-    if (buf[i + 1] === 'g') {
-      return applyMotionNTimes('gg', text, cursor, count);
+    const second = buf[i + 1];
+    if (second === 'g') {
+      return { kind: 'cursor', value: applyMotionNTimes('gg', text, cursor, count) };
+    }
+    if (second === 'e' || second === 'E') {
+      return { kind: 'cursor', value: applyMotionNTimes('g' + second, text, cursor, count) };
     }
     return 'invalid';
   }
 
-  // f{char} / t{char}
-  if (key === 'f' || key === 't') {
+  // f/F/t/T — record for ; , repeat
+  if (key === 'f' || key === 'F' || key === 't' || key === 'T') {
     if (i + 1 >= buf.length) return 'pending';
-    return applyMotionNTimes(key, text, cursor, count, buf[i + 1]);
+    lastCharMotion = { motion: key as 'f' | 'F' | 't' | 'T', char: buf[i + 1] };
+    return { kind: 'cursor', value: applyMotionNTimes(key, text, cursor, count, buf[i + 1]) };
+  }
+
+  // ; / , — resolve against stored last f/F/t/T
+  if (key === ';' || key === ',') {
+    const resolved = resolveCharRepeat(key);
+    if (!resolved) return 'invalid';
+    return {
+      kind: 'cursor',
+      value: applyMotionNTimes(resolved.motion, text, cursor, count, resolved.char, true),
+    };
   }
 
   if (VISUAL_MOTIONS.has(key)) {
-    return applyMotionNTimes(key, text, cursor, count);
+    return { kind: 'cursor', value: applyMotionNTimes(key, text, cursor, count) };
   }
 
   return 'invalid';
@@ -521,12 +612,9 @@ function applyMotionNTimes(
   cursor: number,
   count: number,
   charArg?: string,
+  isRepeat = false,
 ): number {
-  let pos = cursor;
-  for (let n = 0; n < count; n++) {
-    pos = executeMotion(motion, text, pos, charArg);
-  }
-  return pos;
+  return applyMotionRepeated(motion, text, cursor, count, charArg, isRepeat);
 }
 
 function updateVisualSelection(): void {
@@ -598,18 +686,17 @@ function processParseResult(result: ParseResult): void {
   }
 
   if (result.status === 'complete') {
-    const cmd = result.command;
+    const cmd = normalizeCharMotion(result.command);
 
     if (cmd.operator === null) {
       // Pure motion
-      let newCursor = cursor;
-      for (let i = 0; i < cmd.count; i++) {
-        newCursor = executeMotion(cmd.motion!, text, newCursor, cmd.charArg);
-      }
+      const newCursor = applyMotionRepeated(
+        cmd.motion!, text, cursor, cmd.count, cmd.charArg, cmd.isCharMotionRepeat ?? false,
+      );
       activeAdapter.setCursorPosition(newCursor);
       clampNormalCursor();
     } else {
-      // Operator + motion
+      // Operator + motion / text object
       pushUndo(activeElement, text);
       let edit;
       switch (cmd.operator) {
@@ -622,6 +709,15 @@ function processParseResult(result: ParseResult): void {
         case 'y':
           edit = yankOp(text, cursor, cmd, registers);
           copyToClipboard(registers.get('"').text);
+          break;
+        case 'gu':
+          edit = caseOp(text, cursor, cmd, 'lower');
+          break;
+        case 'gU':
+          edit = caseOp(text, cursor, cmd, 'upper');
+          break;
+        case 'g~':
+          edit = caseOp(text, cursor, cmd, 'toggle');
           break;
         default:
           return;
@@ -643,6 +739,30 @@ function processParseResult(result: ParseResult): void {
     cursorRenderer.update();
     statusBar.setCommandBuffer('');
   }
+}
+
+/**
+ * Record f/F/t/T for later `;`/`,` repeats, and rewrite `;`/`,` commands
+ * into their effective motion before execution.
+ */
+function normalizeCharMotion(cmd: Command): Command {
+  if (cmd.motion === 'f' || cmd.motion === 'F' || cmd.motion === 't' || cmd.motion === 'T') {
+    if (cmd.charArg) {
+      lastCharMotion = { motion: cmd.motion as 'f' | 'F' | 't' | 'T', char: cmd.charArg };
+    }
+    return cmd;
+  }
+  if (cmd.motion === ';' || cmd.motion === ',') {
+    const resolved = resolveCharRepeat(cmd.motion);
+    if (!resolved) return cmd;
+    return {
+      ...cmd,
+      motion: resolved.motion,
+      charArg: resolved.char,
+      isCharMotionRepeat: true,
+    };
+  }
+  return cmd;
 }
 
 function handleAction(
@@ -719,6 +839,81 @@ function handleAction(
       pushUndo(activeElement, text);
       const edit = deleteChar(text, cursor, count, registers);
       activeAdapter.setText(edit.text);
+      activeAdapter.setCursorPosition(edit.cursor);
+      clampNormalCursor();
+      cursorRenderer.update();
+      break;
+    }
+
+    case 'X': {
+      pushUndo(activeElement, text);
+      const edit = deleteCharBefore(text, cursor, count, registers);
+      if (edit.text !== text) activeAdapter.setText(edit.text);
+      activeAdapter.setCursorPosition(edit.cursor);
+      clampNormalCursor();
+      cursorRenderer.update();
+      break;
+    }
+
+    case 'D': {
+      // Delete to end of line (= d$)
+      pushUndo(activeElement, text);
+      const cmd: Command = { count: 1, operator: 'd', motion: '$', linewise: false };
+      const edit = deleteOp(text, cursor, cmd, registers);
+      activeAdapter.setText(edit.text);
+      activeAdapter.setCursorPosition(edit.cursor);
+      clampNormalCursor();
+      cursorRenderer.update();
+      break;
+    }
+
+    case 'C': {
+      // Change to end of line (= c$)
+      pushUndo(activeElement, text);
+      const cmd: Command = { count: 1, operator: 'c', motion: '$', linewise: false };
+      const edit = changeOp(text, cursor, cmd, registers);
+      activeAdapter.setText(edit.text);
+      activeAdapter.setCursorPosition(edit.cursor);
+      modeManager.enterInsert();
+      updateModeUI();
+      break;
+    }
+
+    case 'Y': {
+      // Yank entire line(s) (= yy)
+      const cmd: Command = { count, operator: 'y', motion: null, linewise: true };
+      yankOp(text, cursor, cmd, registers);
+      copyToClipboard(registers.get('"').text);
+      break;
+    }
+
+    case 's': {
+      // Substitute: delete `count` chars then enter insert
+      pushUndo(activeElement, text);
+      const edit = deleteChar(text, cursor, count, registers);
+      activeAdapter.setText(edit.text);
+      activeAdapter.setCursorPosition(edit.cursor);
+      modeManager.enterInsert();
+      updateModeUI();
+      break;
+    }
+
+    case 'S': {
+      // Substitute line: equivalent to cc
+      pushUndo(activeElement, text);
+      const cmd: Command = { count, operator: 'c', motion: null, linewise: true };
+      const edit = changeOp(text, cursor, cmd, registers);
+      activeAdapter.setText(edit.text);
+      activeAdapter.setCursorPosition(edit.cursor);
+      modeManager.enterInsert();
+      updateModeUI();
+      break;
+    }
+
+    case '~': {
+      pushUndo(activeElement, text);
+      const edit = toggleCaseChar(text, cursor, count);
+      if (edit.text !== text) activeAdapter.setText(edit.text);
       activeAdapter.setCursorPosition(edit.cursor);
       clampNormalCursor();
       cursorRenderer.update();

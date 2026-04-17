@@ -85,12 +85,17 @@ export function lineEnd(text: string, cursor: number): number {
 
 // ─── Word motions ────────────────────────────────────────────────
 
-function isWordChar(ch: string): boolean {
+export function isWordChar(ch: string): boolean {
   return /[\w]/.test(ch);
 }
 
-function isWhitespace(ch: string): boolean {
+export function isWhitespace(ch: string): boolean {
   return /\s/.test(ch);
+}
+
+/** A "WORD" (capital-W) char is any non-whitespace. */
+function isWORDChar(ch: string): boolean {
+  return !isWhitespace(ch);
 }
 
 /** w — word forward: move to start of next word */
@@ -183,7 +188,196 @@ export function tillCharForward(text: string, cursor: number, ch: string): numbe
   return found - 1;
 }
 
+/** F{char} — find char backward on current line (inclusive) */
+export function findCharBackward(text: string, cursor: number, ch: string): number {
+  const start = lineStartOf(text, cursor);
+  for (let i = cursor - 1; i >= start; i--) {
+    if (text[i] === ch) return i;
+  }
+  return cursor;
+}
+
+/** T{char} — till char backward (land one char after the found char) */
+export function tillCharBackward(text: string, cursor: number, ch: string): number {
+  const found = findCharBackward(text, cursor, ch);
+  if (found === cursor) return cursor;
+  return found + 1;
+}
+
+// ─── WORD motions (capital variants — whitespace-separated) ─────
+
+/** W — WORD forward */
+export function WORDForward(text: string, cursor: number): number {
+  let i = cursor;
+  const len = text.length;
+  if (i >= len) return clamp(len - 1, text);
+
+  while (i < len && isWORDChar(text[i])) i++;
+  while (i < len && isWhitespace(text[i])) i++;
+
+  return clamp(i, text);
+}
+
+/** B — WORD backward */
+export function WORDBackward(text: string, cursor: number): number {
+  let i = cursor;
+  if (i <= 0) return 0;
+
+  i--;
+  while (i > 0 && isWhitespace(text[i])) i--;
+  while (i > 0 && isWORDChar(text[i - 1])) i--;
+
+  return Math.max(0, i);
+}
+
+/** E — end of WORD */
+export function WORDEnd(text: string, cursor: number): number {
+  let i = cursor;
+  const len = text.length;
+  if (i >= len - 1) return clamp(len - 1, text);
+
+  i++;
+  while (i < len && isWhitespace(text[i])) i++;
+  while (i + 1 < len && isWORDChar(text[i + 1])) i++;
+
+  return clamp(i, text);
+}
+
+// ─── ge / gE — end of previous (W)ORD ────────────────────────────
+
+/**
+ * Shared logic for `ge` / `gE`. `wordPred` decides what counts as a
+ * word char (word → identifier-like, WORD → any non-whitespace).
+ */
+function endOfPreviousWord(
+  text: string,
+  cursor: number,
+  wordPred: (ch: string) => boolean,
+): number {
+  if (cursor <= 0) return 0;
+
+  let i = cursor;
+  // If cursor is inside a word, skip backward through the current word first
+  // so we land in whitespace between this word and the previous one.
+  if (i < text.length && !isWhitespace(text[i])) {
+    const klass = wordPred(text[i]) ? 'word' : 'nonword';
+    while (
+      i > 0 &&
+      !isWhitespace(text[i - 1]) &&
+      (wordPred(text[i - 1]) ? 'word' : 'nonword') === klass
+    ) {
+      i--;
+    }
+    i--; // step past the start of current word
+  } else {
+    i--;
+  }
+
+  if (i < 0) return 0;
+
+  // Skip backward through whitespace to land on the previous word's end
+  while (i > 0 && isWhitespace(text[i])) i--;
+  return Math.max(0, i);
+}
+
+/** ge — end of previous word */
+export function wordEndBackward(text: string, cursor: number): number {
+  return endOfPreviousWord(text, cursor, isWordChar);
+}
+
+/** gE — end of previous WORD */
+export function WORDEndBackward(text: string, cursor: number): number {
+  return endOfPreviousWord(text, cursor, isWORDChar);
+}
+
+// ─── ^ — first non-blank char on line ────────────────────────────
+
+export function firstNonBlank(text: string, cursor: number): number {
+  const start = lineStartOf(text, cursor);
+  const end = lineEndOf(text, cursor);
+  let i = start;
+  while (i < end && (text[i] === ' ' || text[i] === '\t')) i++;
+  return i;
+}
+
+// ─── % — matching bracket ────────────────────────────────────────
+
+const OPEN_BRACKETS: Record<string, string> = { '(': ')', '[': ']', '{': '}', '<': '>' };
+const CLOSE_BRACKETS: Record<string, string> = { ')': '(', ']': '[', '}': '{', '>': '<' };
+
+/** % — jump to matching bracket.
+ *  If the cursor is not on a bracket, scan forward on the current line
+ *  for the next bracket (mirrors Vim's behaviour).
+ */
+export function matchingBracket(text: string, cursor: number): number {
+  if (text.length === 0) return cursor;
+
+  let pos = cursor;
+  // If not on a bracket, search forward on the current line for one.
+  if (!OPEN_BRACKETS[text[pos]] && !CLOSE_BRACKETS[text[pos]]) {
+    const end = lineEndOf(text, cursor);
+    while (pos < end && !OPEN_BRACKETS[text[pos]] && !CLOSE_BRACKETS[text[pos]]) pos++;
+    if (pos >= end) return cursor;
+  }
+
+  const ch = text[pos];
+  if (OPEN_BRACKETS[ch]) {
+    const match = OPEN_BRACKETS[ch];
+    let depth = 1;
+    for (let i = pos + 1; i < text.length; i++) {
+      if (text[i] === ch) depth++;
+      else if (text[i] === match) {
+        depth--;
+        if (depth === 0) return i;
+      }
+    }
+    return cursor;
+  }
+
+  const match = CLOSE_BRACKETS[ch];
+  let depth = 1;
+  for (let i = pos - 1; i >= 0; i--) {
+    if (text[i] === ch) depth++;
+    else if (text[i] === match) {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return cursor;
+}
+
 // ─── Motion dispatcher ──────────────────────────────────────────
+
+/**
+ * Iterate a motion `count` times with correct advance semantics for the
+ * `t` / `T` motions:
+ *   - `t` alone stops one before the target and the `till` behaviour means
+ *     a naive second call stays stuck; for counted `t` (`3tx`) or `;` after
+ *     `tx`, we need to advance past the current target before searching.
+ *   - `isRepeat` covers `;` / `,`; `i > 0` covers count-based repeats
+ *     (`3tx` iterates three times internally).
+ */
+export function applyMotionRepeated(
+  motionKey: string,
+  text: string,
+  cursor: number,
+  count: number,
+  charArg?: string,
+  isRepeat = false,
+): number {
+  let pos = cursor;
+  for (let i = 0; i < count; i++) {
+    const needAdvance = (motionKey === 't' || motionKey === 'T') && (isRepeat || i > 0);
+    let from = pos;
+    if (needAdvance) {
+      from = motionKey === 't'
+        ? Math.min(pos + 1, text.length)
+        : Math.max(pos - 1, 0);
+    }
+    pos = executeMotion(motionKey, text, from, charArg);
+  }
+  return pos;
+}
 
 /**
  * Execute a named motion, returning the new cursor position.
@@ -209,6 +403,31 @@ export function executeMotion(
     case 'G': return documentEnd(text, cursor);
     case 'f': return charArg ? findCharForward(text, cursor, charArg) : cursor;
     case 't': return charArg ? tillCharForward(text, cursor, charArg) : cursor;
+    case 'F': return charArg ? findCharBackward(text, cursor, charArg) : cursor;
+    case 'T': return charArg ? tillCharBackward(text, cursor, charArg) : cursor;
+    case 'W': return WORDForward(text, cursor);
+    case 'B': return WORDBackward(text, cursor);
+    case 'E': return WORDEnd(text, cursor);
+    case 'ge': return wordEndBackward(text, cursor);
+    case 'gE': return WORDEndBackward(text, cursor);
+    case '^': return firstNonBlank(text, cursor);
+    case '%': return matchingBracket(text, cursor);
     default: return cursor;
   }
 }
+
+/**
+ * Motions that are *inclusive* of the end character for operator ranges.
+ * Used by operators to decide whether to include the target character.
+ */
+export const INCLUSIVE_MOTIONS = new Set([
+  'e', 'E', '$', 'f', 't', 'F', 'T', 'G', 'gg', '%',
+]);
+
+/**
+ * Motions whose natural range is "exclusive" — the target character
+ * should NOT be included in an operator range.
+ */
+export const EXCLUSIVE_MOTIONS = new Set([
+  'w', 'W', 'b', 'B', 'ge', 'gE', '0', '^', 'h', 'l', '{', '}',
+]);

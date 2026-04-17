@@ -235,6 +235,92 @@ describe('ContentEditableAdapter', () => {
     expect(inputFired).toBe(true);
     expect(changeFired).toBe(true);
   });
+
+  // ---------------------------------------------------------------------------
+  // Shift+Enter in real-world rich text editors produces either a <br> in the
+  // current block or a split into two block-level siblings. Both MUST be
+  // visible as a '\n' in getText() with cursor offsets on either side aligned
+  // to that newline, so j/k motions can jump between lines.
+  // ---------------------------------------------------------------------------
+
+  const setSelection = (node: Node, offset: number): void => {
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.setStart(node, offset);
+    range.collapse(true);
+    sel!.removeAllRanges();
+    sel!.addRange(range);
+  };
+
+  it('treats <br> between text nodes as a newline', () => {
+    // Matches what Chrome's plaintext contenteditable does on Shift+Enter.
+    div.innerHTML = 'hello<br>world';
+    expect(adapter.getText()).toBe('hello\nworld');
+    expect(adapter.getLineCount()).toBe(2);
+    expect(adapter.getLine(0)).toBe('hello');
+    expect(adapter.getLine(1)).toBe('world');
+  });
+
+  it('reports cursor offset past <br> including the implicit newline', () => {
+    div.innerHTML = 'hello<br>world';
+    const worldText = div.childNodes[2] as Text;
+    // Cursor in the middle of "world" (after 'w', before 'o')
+    setSelection(worldText, 1);
+    // innerText is "hello\nworld"; offset 7 lands between 'w' and 'o'.
+    expect(adapter.getCursorPosition()).toBe(7);
+  });
+
+  it('places the cursor on line 2 when setCursorPosition targets past a <br>', () => {
+    div.innerHTML = 'hello<br>world';
+    adapter.setCursorPosition(6); // start of "world"
+    const sel = window.getSelection()!;
+    expect(sel.rangeCount).toBe(1);
+    const r = sel.getRangeAt(0);
+    expect(r.startContainer).toBe(div.childNodes[2]); // "world" text node
+    expect(r.startOffset).toBe(0);
+  });
+
+  it('treats sibling block elements (like ProseMirror <p>) as newline-separated', () => {
+    // This is what Claude/Gemini produce for Shift+Enter: split paragraphs.
+    div.innerHTML = '<p>line one</p><p>line two</p>';
+    expect(adapter.getText()).toBe('line one\nline two');
+    expect(adapter.getLineCount()).toBe(2);
+  });
+
+  it('roundtrips cursor position through the synthetic newline in <p><p>', () => {
+    div.innerHTML = '<p>line one</p><p>line two</p>';
+    const secondP = div.children[1] as HTMLElement;
+    const secondText = secondP.firstChild as Text;
+    // Cursor at start of second paragraph
+    setSelection(secondText, 0);
+    // "line one" is 8 chars, then the synthetic '\n' → offset 9 is start of "line two"
+    expect(adapter.getCursorPosition()).toBe(9);
+
+    // And setting the cursor back to 9 should land us at the start of "line two"
+    adapter.setCursorPosition(9);
+    const sel = window.getSelection()!;
+    const r = sel.getRangeAt(0);
+    expect(r.startContainer).toBe(secondText);
+    expect(r.startOffset).toBe(0);
+  });
+
+  it('does not lose line alignment when the paragraph also has <br> within it', () => {
+    div.innerHTML = '<p>ab<br>cd</p><p>ef</p>';
+    expect(adapter.getText()).toBe('ab\ncd\nef');
+    // "ab" = 2 chars, "\n" = 1, "cd" = 2 chars, "\n" = 1, "ef" at offset 6
+    adapter.setCursorPosition(6);
+    const r = window.getSelection()!.getRangeAt(0);
+    expect(r.startContainer).toBe((div.children[1] as HTMLElement).firstChild);
+    expect(r.startOffset).toBe(0);
+  });
+
+  it('offsetToLineCol sees the newlines created by <br>', () => {
+    div.innerHTML = 'hello<br>world';
+    expect(adapter.offsetToLineCol(0)).toEqual({ line: 0, column: 0 });
+    expect(adapter.offsetToLineCol(5)).toEqual({ line: 0, column: 5 });
+    expect(adapter.offsetToLineCol(6)).toEqual({ line: 1, column: 0 });
+    expect(adapter.offsetToLineCol(10)).toEqual({ line: 1, column: 4 });
+  });
 });
 
 // ---------------------------------------------------------------------------

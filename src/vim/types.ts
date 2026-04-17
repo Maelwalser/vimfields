@@ -20,14 +20,21 @@ export interface TextEdit {
 export interface Command {
   /** Repeat count (default 1) */
   count: number;
-  /** Operator key (d, c, y, etc.) or null for motion-only */
+  /** Operator key (d, c, y, gu, gU, g~) or null for motion-only */
   operator: string | null;
   /** Motion key (w, b, e, $, etc.) or null for operator-only commands */
   motion: string | null;
-  /** Extra character argument (for f, t, r commands) */
+  /** Extra character argument (for f, t, F, T, r commands) */
   charArg?: string;
   /** Whether this is a line-wise command (dd, yy, cc) */
   linewise?: boolean;
+  /** Text object, if this command targets one (e.g. ciw → { kind: 'w', around: false }) */
+  textObject?: { kind: string; around: boolean };
+  /**
+   * True when the motion originated from a ;/, repeat of f/F/t/T.
+   * Signals t/T to advance past the current target before searching.
+   */
+  isCharMotionRepeat?: boolean;
 }
 
 /** Register name type — single char */
