@@ -11,6 +11,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:dom": "vitest run tests/dom/",
+    "package": "npm run build && node scripts/package.mjs",
     "install:vivaldi": "npm run build && node scripts/install-vivaldi.mjs",
     "uninstall:vivaldi": "node scripts/install-vivaldi.mjs --uninstall"
   },

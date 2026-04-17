@@ -10,7 +10,7 @@
   <div class="popup">
     <header class="header">
       <h1 class="title">VimFields</h1>
-      <label class="toggle">
+      <label class="toggle" aria-label="Enable VimFields">
         <input type="checkbox" id="enabled-toggle" checked>
         <span class="toggle-slider"></span>
       </label>
@@ -25,15 +25,38 @@
     </section>
 
     <section class="section">
-      <label class="field-label" for="disabled-sites">
+      <span class="field-label">
         Disabled sites
-        <span class="field-hint">One domain per line</span>
-      </label>
-      <textarea id="disabled-sites" class="textarea" rows="4" placeholder="example.com&#10;mail.google.com"></textarea>
+        <span class="field-hint">
+          VimFields is off on these hosts and their subdomains.
+          Use <code>*.example.com</code> to exclude only subdomains.
+        </span>
+      </span>
+
+      <div class="current-site" id="current-site-row">
+        <span class="current-site-host" id="current-site-host">—</span>
+        <button type="button" id="current-site-btn" class="btn btn-small">
+          Disable here
+        </button>
+      </div>
+
+      <ul class="chip-list" id="disabled-sites-list" aria-label="Disabled sites"></ul>
+
+      <form class="add-row" id="add-form">
+        <input
+          type="text"
+          id="add-input"
+          class="input"
+          placeholder="example.com or *.example.com"
+          autocomplete="off"
+          spellcheck="false"
+        >
+        <button type="submit" class="btn">Add</button>
+      </form>
     </section>
 
     <footer class="footer">
-      <span id="status" class="status"></span>
+      <span id="status" class="status" role="status" aria-live="polite"></span>
     </footer>
   </div>
 

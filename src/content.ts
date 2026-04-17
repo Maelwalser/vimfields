@@ -11,6 +11,7 @@ import { FieldDetector } from './dom/field-detector';
 import { createTextAdapter, type TextAdapter } from './dom/text-adapter';
 import { CursorRenderer } from './dom/cursor-renderer';
 import { StatusBar } from './dom/status-bar';
+import { isHostDisabled } from './dom/site-matcher';
 import { ModeManager } from './vim/mode-manager';
 import { VimMode as VimModeEnum } from './vim/types';
 import { CommandParser, type ParseResult } from './vim/command-parser';
@@ -169,10 +170,7 @@ function toRendererMode(mode: VimModeEnum): 'normal' | 'insert' | 'visual' {
 }
 
 function isSiteDisabled(): boolean {
-  const host = window.location.hostname;
-  return config.disabledSites.some(
-    (pattern) => host === pattern || host.endsWith('.' + pattern),
-  );
+  return isHostDisabled(window.location.hostname, config.disabledSites);
 }
 
 // ── Field attachment ───────────────────────────────────────────────
@@ -837,12 +835,10 @@ async function init(): Promise<void> {
     // Extension context may not be ready yet — use defaults
   }
 
-  if (!config.enabled || isSiteDisabled()) return;
-
-  // Listen for keydown on the document (capture phase to intercept before the field)
+  // Attach unconditionally; handleKeyDown and onFieldFocus gate on config.enabled
+  // and isSiteDisabled() so a runtime toggle or disabled-sites edit takes effect
+  // without a page reload.
   document.addEventListener('keydown', handleKeyDown, true);
-
-  // Start detecting fields
   fieldDetector.start();
 }
 
