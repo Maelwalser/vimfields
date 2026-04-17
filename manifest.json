@@ -3,7 +3,7 @@
   "name": "VimFields",
   "version": "0.1.0",
   "description": "Vim keybindings for text fields in the browser",
-  "permissions": ["activeTab", "storage", "clipboardWrite"],
+  "permissions": ["activeTab", "storage", "clipboardRead", "clipboardWrite"],
   "background": {
     "service_worker": "dist/src/background.js",
     "type": "module"
@@ -12,7 +12,9 @@
     {
       "matches": ["<all_urls>"],
       "js": ["dist/src/content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true
     }
   ],
   "action": {

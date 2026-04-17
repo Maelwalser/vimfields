@@ -2,10 +2,10 @@
  * Content script entry point.
  *
  * Discovers editable fields, attaches Vim key handling,
- * renders the block cursor and status bar.
+ * renders the block cursor, selection highlight, and status bar.
  */
 
-import { VimMode, MessageType, type ExtensionMessage, type VimConfig } from './types';
+import { MessageType, type ExtensionMessage, type VimConfig } from './types';
 import { DEFAULT_CONFIG } from './constants';
 import { FieldDetector } from './dom/field-detector';
 import { createTextAdapter, type TextAdapter } from './dom/text-adapter';
@@ -58,6 +58,105 @@ function popUndo(el: HTMLElement): string | undefined {
 let escapeRemapBuffer = '';
 let escapeRemapTimeout: ReturnType<typeof setTimeout> | null = null;
 
+// ── Clipboard ──────────────────────────────────────────────────────
+
+/**
+ * Write text to the system clipboard so it's pastable in other tabs/apps.
+ * Falls back to a hidden-textarea + execCommand trick when the async API
+ * is unavailable (old Chrome, non-secure context, etc.).
+ */
+function copyToClipboard(text: string): void {
+  if (!text) return;
+
+  const asyncWrite = navigator.clipboard?.writeText;
+  if (asyncWrite) {
+    asyncWrite.call(navigator.clipboard, text).catch(() => execCommandCopy(text));
+    return;
+  }
+  execCommandCopy(text);
+}
+
+function execCommandCopy(text: string): void {
+  const active = document.activeElement as HTMLElement | null;
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.setAttribute('aria-hidden', 'true');
+  ta.style.position = 'fixed';
+  ta.style.top = '0';
+  ta.style.left = '-9999px';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+
+  try {
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    document.execCommand('copy');
+  } catch {
+    // Best-effort — internal register still holds the text
+  } finally {
+    ta.remove();
+    active?.focus();
+  }
+}
+
+/**
+ * Read the system clipboard, returning null if unavailable or denied.
+ * Called before p/P so yanks made in other tabs can be pasted here.
+ */
+async function readClipboard(): Promise<string | null> {
+  try {
+    const text = await navigator.clipboard?.readText();
+    return typeof text === 'string' ? text : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Sync the unnamed register from the system clipboard when they diverge,
+ * so cross-tab / cross-app copies are pasteable. Clipboard text ending in
+ * a newline is treated as a linewise yank (matching Vim's convention).
+ */
+async function syncRegisterFromClipboard(): Promise<void> {
+  const clip = await readClipboard();
+  if (clip == null) return;
+  const current = registers.get('"').text;
+  if (clip === current) return;
+  const linewise = clip.endsWith('\n');
+  registers.recordYank(clip, linewise);
+}
+
+/** Paste from the system clipboard (falling back to the unnamed register). */
+async function doPaste(after: boolean): Promise<void> {
+  if (!activeAdapter || !activeElement) return;
+  const adapter = activeAdapter;
+  const element = activeElement;
+
+  await syncRegisterFromClipboard();
+
+  // The user may have blurred or refocused a different field while the
+  // clipboard read was in flight — bail out if the target changed.
+  if (activeAdapter !== adapter || activeElement !== element) return;
+
+  const text = adapter.getText();
+  const cursor = adapter.getCursorPosition();
+  pushUndo(element, text);
+
+  const edit = after
+    ? pasteAfter(text, cursor, registers)
+    : pasteBefore(text, cursor, registers);
+
+  adapter.setText(edit.text);
+  adapter.setCursorPosition(edit.cursor);
+  clampNormalCursor();
+  cursorRenderer.update();
+}
+
+// ── Visual mode motion buffer ──────────────────────────────────────
+
+let visualBuffer = '';
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 function toRendererMode(mode: VimModeEnum): 'normal' | 'insert' | 'visual' {
@@ -101,6 +200,7 @@ function onFieldFocus(element: HTMLElement): void {
   statusBar.setMode(mode);
   parser.reset();
   escapeRemapBuffer = '';
+  visualBuffer = '';
 }
 
 function onFieldBlur(_element: HTMLElement): void {
@@ -110,6 +210,7 @@ function onFieldBlur(_element: HTMLElement): void {
   activeElement = null;
   parser.reset();
   escapeRemapBuffer = '';
+  visualBuffer = '';
 }
 
 // ── Key handling ───────────────────────────────────────────────────
@@ -126,12 +227,15 @@ function handleKeyDown(e: KeyboardEvent): void {
     return;
   }
 
-  // Normal / Visual mode
-  e.preventDefault();
-  e.stopPropagation();
+  // Pass browser / user-configured shortcuts (e.g. Ctrl+K, Ctrl+L in Vivaldi)
+  // through to the browser instead of intercepting them as Vim motions.
+  if (isBrowserShortcut(e)) return;
 
   const key = mapKey(e);
   if (!key) return;
+
+  e.preventDefault();
+  e.stopPropagation();
 
   if (mode === VimModeEnum.Visual || mode === VimModeEnum.VisualLine) {
     handleVisualKey(key);
@@ -140,10 +244,24 @@ function handleKeyDown(e: KeyboardEvent): void {
   }
 }
 
+/**
+ * Returns true for any modifier combo we don't explicitly implement, so the
+ * browser/OS gets a chance to run its own handler (tab switching, find, etc.).
+ * Shift is ignored — it's how capital letters like G/J arrive.
+ */
+function isBrowserShortcut(e: KeyboardEvent): boolean {
+  if (!e.ctrlKey && !e.altKey && !e.metaKey) return false;
+  // Vim's two explicit Ctrl bindings — handle these ourselves.
+  if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'c' || e.key === 'r')) {
+    return false;
+  }
+  return true;
+}
+
 function mapKey(e: KeyboardEvent): string | null {
   if (e.key === 'Escape') return '\x1b';
-  if (e.ctrlKey && e.key === 'c') return '\x03';
-  if (e.ctrlKey && e.key === 'r') return '\x12';
+  if (e.ctrlKey && !e.altKey && !e.metaKey && e.key === 'c') return '\x03';
+  if (e.ctrlKey && !e.altKey && !e.metaKey && e.key === 'r') return '\x12';
   if (e.key.length === 1) return e.key;
   return null;
 }
@@ -163,7 +281,10 @@ function handleInsertKey(e: KeyboardEvent): void {
     return;
   }
 
-  // Escape remap (e.g. "jk")
+  // Escape remap (e.g. "jk"). Modifier combos (Ctrl+K, Alt+L, ...) should
+  // pass through to the browser unchanged and not pollute the buffer.
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
+
   if (config.escapeRemap && e.key.length === 1) {
     const remap = config.escapeRemap;
     escapeRemapBuffer += e.key;
@@ -212,7 +333,27 @@ function exitInsertMode(): void {
     if (pos > 0) {
       activeAdapter.setCursorPosition(pos - 1);
     }
+    clampNormalCursor();
     cursorRenderer.update();
+  }
+}
+
+/** In normal mode, the cursor sits ON a character, not past it. */
+function clampNormalCursor(): void {
+  if (!activeAdapter) return;
+  const text = activeAdapter.getText();
+  if (text.length === 0) {
+    activeAdapter.setCursorPosition(0);
+    return;
+  }
+  const pos = activeAdapter.getCursorPosition();
+  if (pos >= text.length) {
+    activeAdapter.setCursorPosition(text.length - 1);
+    return;
+  }
+  // If the cursor is on a trailing newline, step back onto the last char of the line
+  if (text[pos] === '\n' && pos > 0 && text[pos - 1] !== '\n') {
+    activeAdapter.setCursorPosition(pos - 1);
   }
 }
 
@@ -225,61 +366,222 @@ function handleNormalKey(key: string): void {
   processParseResult(result);
 }
 
+// ── Visual mode ────────────────────────────────────────────────────
+
 function handleVisualKey(key: string): void {
   if (!activeAdapter || !activeElement) return;
 
-  // Escape exits visual mode
+  // Escape / Ctrl-C exits visual mode
   if (key === '\x1b' || key === '\x03') {
-    modeManager.enterNormal();
-    updateModeUI();
+    exitVisualMode();
     return;
   }
+
+  // Operators and non-motion keys are only accepted when no motion is in progress
+  if (visualBuffer === '') {
+    const text = activeAdapter.getText();
+    const cursor = activeAdapter.getCursorPosition();
+    const isLinewise = modeManager.mode === VimModeEnum.VisualLine;
+
+    switch (key) {
+      case 'd':
+      case 'x':
+      case 'X': {
+        pushUndo(activeElement, text);
+        const edit = deleteSelection(text, visualAnchor, cursor, isLinewise, registers);
+        activeAdapter.setText(edit.text);
+        activeAdapter.setCursorPosition(edit.cursor);
+        exitVisualMode();
+        return;
+      }
+      case 'y': {
+        yankSelection(text, visualAnchor, cursor, isLinewise, registers);
+        copyToClipboard(registers.get('"').text);
+        activeAdapter.setCursorPosition(Math.min(visualAnchor, cursor));
+        exitVisualMode();
+        return;
+      }
+      case 'c':
+      case 's': {
+        pushUndo(activeElement, text);
+        const edit = changeSelection(text, visualAnchor, cursor, isLinewise, registers);
+        activeAdapter.setText(edit.text);
+        activeAdapter.setCursorPosition(edit.cursor);
+        modeManager.enterInsert();
+        updateModeUI();
+        cursorRenderer.clearSelection();
+        return;
+      }
+      case 'o': {
+        // Swap anchor and cursor — keeps the selection, moves the "active end"
+        const newAnchor = cursor;
+        activeAdapter.setCursorPosition(visualAnchor);
+        visualAnchor = newAnchor;
+        updateVisualSelection();
+        return;
+      }
+      case 'v': {
+        if (modeManager.mode === VimModeEnum.VisualLine) {
+          modeManager.enterVisual();
+          updateModeUI();
+          updateVisualSelection();
+        } else {
+          exitVisualMode();
+        }
+        return;
+      }
+      case 'V': {
+        if (modeManager.mode === VimModeEnum.Visual) {
+          modeManager.enterVisualLine();
+          updateModeUI();
+          updateVisualSelection();
+        } else {
+          exitVisualMode();
+        }
+        return;
+      }
+    }
+  }
+
+  // Anything else is a motion, possibly with a count
+  visualBuffer += key;
+  statusBar.setCommandBuffer(visualBuffer);
+
+  const text = activeAdapter.getText();
+  const cursor = activeAdapter.getCursorPosition();
+  const motion = parseVisualMotion(visualBuffer, text, cursor);
+
+  if (motion === 'pending') return;
+
+  if (motion === 'invalid') {
+    visualBuffer = '';
+    statusBar.setCommandBuffer('');
+    return;
+  }
+
+  activeAdapter.setCursorPosition(motion);
+  updateVisualSelection();
+  visualBuffer = '';
+  statusBar.setCommandBuffer('');
+}
+
+type MotionResult = number | 'pending' | 'invalid';
+
+const VISUAL_MOTIONS = new Set(['h', 'j', 'k', 'l', 'w', 'b', 'e', '$', 'G']);
+
+function parseVisualMotion(buf: string, text: string, cursor: number): MotionResult {
+  let i = 0;
+
+  // Count prefix — but "0" alone is the line-start motion
+  let countStr = '';
+  while (i < buf.length && buf[i] >= '1' && buf[i] <= '9') {
+    countStr += buf[i];
+    i++;
+  }
+  while (
+    countStr && i < buf.length && buf[i] >= '0' && buf[i] <= '9'
+  ) {
+    countStr += buf[i];
+    i++;
+  }
+  const count = countStr ? parseInt(countStr, 10) : 1;
+
+  if (i >= buf.length) return 'pending';
+
+  const key = buf[i];
+
+  // Line-start motion (only when no count prefix consumed)
+  if (key === '0' && !countStr) {
+    return applyMotionNTimes('0', text, cursor, count);
+  }
+
+  // gg — document start
+  if (key === 'g') {
+    if (i + 1 >= buf.length) return 'pending';
+    if (buf[i + 1] === 'g') {
+      return applyMotionNTimes('gg', text, cursor, count);
+    }
+    return 'invalid';
+  }
+
+  // f{char} / t{char}
+  if (key === 'f' || key === 't') {
+    if (i + 1 >= buf.length) return 'pending';
+    return applyMotionNTimes(key, text, cursor, count, buf[i + 1]);
+  }
+
+  if (VISUAL_MOTIONS.has(key)) {
+    return applyMotionNTimes(key, text, cursor, count);
+  }
+
+  return 'invalid';
+}
+
+function applyMotionNTimes(
+  motion: string,
+  text: string,
+  cursor: number,
+  count: number,
+  charArg?: string,
+): number {
+  let pos = cursor;
+  for (let n = 0; n < count; n++) {
+    pos = executeMotion(motion, text, pos, charArg);
+  }
+  return pos;
+}
+
+function updateVisualSelection(): void {
+  if (!activeAdapter) return;
 
   const text = activeAdapter.getText();
   const cursor = activeAdapter.getCursorPosition();
   const isLinewise = modeManager.mode === VimModeEnum.VisualLine;
 
-  // Visual mode operators
-  switch (key) {
-    case 'd': {
-      pushUndo(activeElement, text);
-      const edit = deleteSelection(text, visualAnchor, cursor, isLinewise, registers);
-      activeAdapter.setText(edit.text);
-      activeAdapter.setCursorPosition(edit.cursor);
-      modeManager.enterNormal();
-      updateModeUI();
-      return;
-    }
-    case 'y': {
-      yankSelection(text, visualAnchor, cursor, isLinewise, registers);
-      modeManager.enterNormal();
-      activeAdapter.setCursorPosition(Math.min(visualAnchor, cursor));
-      updateModeUI();
-      return;
-    }
-    case 'c': {
-      pushUndo(activeElement, text);
-      const edit = changeSelection(text, visualAnchor, cursor, isLinewise, registers);
-      activeAdapter.setText(edit.text);
-      activeAdapter.setCursorPosition(edit.cursor);
-      modeManager.enterInsert();
-      updateModeUI();
-      return;
-    }
+  let selStart: number;
+  let selEnd: number;
+
+  if (isLinewise) {
+    const lo = Math.min(visualAnchor, cursor);
+    const hi = Math.max(visualAnchor, cursor);
+    selStart = text.lastIndexOf('\n', lo - 1) + 1;
+    const nextNL = text.indexOf('\n', hi);
+    selEnd = nextNL === -1 ? text.length : nextNL + 1;
+  } else {
+    selStart = Math.min(visualAnchor, cursor);
+    selEnd = Math.min(Math.max(visualAnchor, cursor) + 1, text.length);
   }
 
-  // Visual mode motions — extend selection
-  const motionKeys = new Set(['h', 'j', 'k', 'l', 'w', 'b', 'e', '0', '$', 'G']);
-  if (motionKeys.has(key)) {
-    const newCursor = executeMotion(key, text, cursor);
-    activeAdapter.setCursorPosition(newCursor);
-    // Update visual selection highlight
-    const selStart = Math.min(visualAnchor, newCursor);
-    const selEnd = Math.max(visualAnchor, newCursor) + 1;
+  // Native selection (for accessibility / copy); our overlay is authoritative visually.
+  try {
     activeAdapter.setSelectionRange(selStart, selEnd);
-    cursorRenderer.update();
+    // setSelectionRange moves the caret; restore our cursor position so the
+    // block cursor stays on the active end of the selection.
+    activeAdapter.setCursorPosition(cursor);
+  } catch {
+    // Some fields reject programmatic selection — ignore
   }
+
+  cursorRenderer.setSelection(selStart, selEnd);
+  cursorRenderer.update();
 }
+
+function exitVisualMode(): void {
+  modeManager.enterNormal();
+  visualBuffer = '';
+  if (activeAdapter) {
+    const pos = activeAdapter.getCursorPosition();
+    try {
+      activeAdapter.setSelectionRange(pos, pos);
+    } catch { /* ignore */ }
+    clampNormalCursor();
+  }
+  cursorRenderer.clearSelection();
+  updateModeUI();
+  statusBar.setCommandBuffer('');
+}
+
+// ── Normal mode parse result dispatch ──────────────────────────────
 
 function processParseResult(result: ParseResult): void {
   if (!activeAdapter || !activeElement) return;
@@ -307,6 +609,7 @@ function processParseResult(result: ParseResult): void {
         newCursor = executeMotion(cmd.motion!, text, newCursor, cmd.charArg);
       }
       activeAdapter.setCursorPosition(newCursor);
+      clampNormalCursor();
     } else {
       // Operator + motion
       pushUndo(activeElement, text);
@@ -320,6 +623,7 @@ function processParseResult(result: ParseResult): void {
           break;
         case 'y':
           edit = yankOp(text, cursor, cmd, registers);
+          copyToClipboard(registers.get('"').text);
           break;
         default:
           return;
@@ -333,6 +637,8 @@ function processParseResult(result: ParseResult): void {
       if (edit.enterInsert) {
         modeManager.enterInsert();
         updateModeUI();
+      } else {
+        clampNormalCursor();
       }
     }
 
@@ -416,6 +722,7 @@ function handleAction(
       const edit = deleteChar(text, cursor, count, registers);
       activeAdapter.setText(edit.text);
       activeAdapter.setCursorPosition(edit.cursor);
+      clampNormalCursor();
       cursorRenderer.update();
       break;
     }
@@ -431,29 +738,20 @@ function handleAction(
       break;
     }
 
-    case 'p': {
-      pushUndo(activeElement, text);
-      const edit = pasteAfter(text, cursor, registers);
-      activeAdapter.setText(edit.text);
-      activeAdapter.setCursorPosition(edit.cursor);
-      cursorRenderer.update();
+    case 'p':
+      void doPaste(true);
       break;
-    }
 
-    case 'P': {
-      pushUndo(activeElement, text);
-      const edit = pasteBefore(text, cursor, registers);
-      activeAdapter.setText(edit.text);
-      activeAdapter.setCursorPosition(edit.cursor);
-      cursorRenderer.update();
+    case 'P':
+      void doPaste(false);
       break;
-    }
 
     case 'J': {
       pushUndo(activeElement, text);
       const edit = joinLines(text, cursor);
       activeAdapter.setText(edit.text);
       activeAdapter.setCursorPosition(edit.cursor);
+      clampNormalCursor();
       cursorRenderer.update();
       break;
     }
@@ -462,7 +760,7 @@ function handleAction(
       const prev = popUndo(activeElement);
       if (prev !== undefined) {
         activeAdapter.setText(prev);
-        activeAdapter.setCursorPosition(Math.min(cursor, prev.length - 1));
+        activeAdapter.setCursorPosition(Math.min(cursor, Math.max(0, prev.length - 1)));
         cursorRenderer.update();
       }
       break;
@@ -476,12 +774,14 @@ function handleAction(
       visualAnchor = cursor;
       modeManager.enterVisual();
       updateModeUI();
+      updateVisualSelection();
       break;
 
     case 'V':
       visualAnchor = cursor;
       modeManager.enterVisualLine();
       updateModeUI();
+      updateVisualSelection();
       break;
   }
 }

@@ -10,7 +10,9 @@
     "watch": "node esbuild.config.mjs --watch",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:dom": "vitest run tests/dom/"
+    "test:dom": "vitest run tests/dom/",
+    "install:vivaldi": "npm run build && node scripts/install-vivaldi.mjs",
+    "uninstall:vivaldi": "node scripts/install-vivaldi.mjs --uninstall"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.287",

@@ -40,12 +40,14 @@ export interface TextAdapter {
 // Dispatch synthetic events so React/Vue controlled inputs stay in sync
 // ---------------------------------------------------------------------------
 
-function dispatchInputEvents(element: HTMLElement): void {
-  // InputEvent for React's synthetic event system
+function dispatchInputEvents(element: HTMLElement, data: string | null = null): void {
+  // InputEvent for React's synthetic event system and contenteditable editors
+  // that diff on inputType/data (Lexical, ProseMirror, Draft, Slate).
   const inputEvent = new InputEvent('input', {
     bubbles: true,
     cancelable: false,
     inputType: 'insertText',
+    data,
   });
   element.dispatchEvent(inputEvent);
 
@@ -247,8 +249,34 @@ export class ContentEditableAdapter implements TextAdapter {
   }
 
   setText(text: string): void {
+    // For framework editors (Lexical, ProseMirror, Draft, Slate) that listen
+    // to beforeinput/input to drive their internal model, execCommand
+    // ('insertText') fires the native event pipeline so the editor stays in
+    // sync. Requires focus; if anything fails we fall back to innerText.
+    const active = document.activeElement as Node | null;
+    const isFocused =
+      active === this.element ||
+      (active != null && this.element.contains(active));
+
+    if (isFocused) {
+      try {
+        const sel = window.getSelection();
+        if (sel) {
+          const range = document.createRange();
+          range.selectNodeContents(this.element);
+          sel.removeAllRanges();
+          sel.addRange(range);
+          if (document.execCommand('insertText', false, text)) {
+            return;
+          }
+        }
+      } catch {
+        // fall through to innerText
+      }
+    }
+
     this.element.innerText = text;
-    dispatchInputEvents(this.element);
+    dispatchInputEvents(this.element, text);
   }
 
   getCursorPosition(): number {
@@ -403,12 +431,13 @@ export function createTextAdapter(element: HTMLElement): TextAdapter | null {
   }
 
   const ceAttr = element.getAttribute('contenteditable');
-  if (
-    element.isContentEditable ||
-    element.contentEditable === 'true' ||
-    ceAttr === 'true' ||
-    ceAttr === ''
-  ) {
+  if (ceAttr === 'true' || ceAttr === '' || ceAttr === 'plaintext-only') {
+    return new ContentEditableAdapter(element);
+  }
+  // IDL fallback — returns 'inherit' on descendants, so it only identifies
+  // explicit editor roots even when the attribute isn't reflected back.
+  const ceIdl = element.contentEditable;
+  if (ceIdl === 'true' || ceIdl === 'plaintext-only') {
     return new ContentEditableAdapter(element);
   }
 

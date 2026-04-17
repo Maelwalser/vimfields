@@ -1,12 +1,14 @@
 /**
- * StatusBar renders a small floating indicator near the bottom-right
- * of the active field showing the current Vim mode and pending command buffer.
+ * StatusBar renders a small floating indicator just below the active field
+ * showing the current Vim mode and pending command buffer. It stays anchored
+ * via a ResizeObserver plus scroll/resize listeners.
  */
 
 import type { VimMode } from './cursor-renderer.js';
 
 const STATUS_CLASS = 'vimfields-status-bar';
 const STYLE_ID = 'vimfields-injected-styles';
+const GAP = 4;
 
 const MODE_LABELS: Record<VimMode, string> = {
   normal: '-- NORMAL --',
@@ -21,6 +23,8 @@ export class StatusBar {
   private targetElement: HTMLElement | null = null;
   private resizeObserver: ResizeObserver | null = null;
 
+  private readonly onScrollOrResize = (): void => this.position();
+
   constructor() {
     this.injectStyles();
   }
@@ -31,9 +35,10 @@ export class StatusBar {
     this.createElement();
     this.position();
 
-    // Reposition on resize/scroll
     this.resizeObserver = new ResizeObserver(() => this.position());
     this.resizeObserver.observe(target);
+    window.addEventListener('scroll', this.onScrollOrResize, true);
+    window.addEventListener('resize', this.onScrollOrResize);
   }
 
   detach(): void {
@@ -43,6 +48,8 @@ export class StatusBar {
     this.bufferSpan = null;
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
+    window.removeEventListener('scroll', this.onScrollOrResize, true);
+    window.removeEventListener('resize', this.onScrollOrResize);
     this.targetElement = null;
   }
 
@@ -66,11 +73,26 @@ export class StatusBar {
     if (!this.el || !this.targetElement) return;
 
     const rect = this.targetElement.getBoundingClientRect();
-    this.el.style.left = `${rect.right - this.el.offsetWidth - 4}px`;
-    this.el.style.top = `${rect.bottom - this.el.offsetHeight - 4}px`;
+    const viewportH = window.innerHeight || document.documentElement.clientHeight;
+    const barH = this.el.offsetHeight || 20;
+
+    // Prefer placement below the field; fall back above if no room.
+    let top = rect.bottom + GAP;
+    if (top + barH > viewportH) {
+      top = Math.max(GAP, rect.top - barH - GAP);
+    }
+
+    // Anchor to the field's right edge.
+    const barW = this.el.offsetWidth || 0;
+    const viewportW = window.innerWidth || document.documentElement.clientWidth;
+    let left = rect.right - barW;
+    left = Math.max(GAP, Math.min(left, viewportW - barW - GAP));
+
+    this.el.style.left = `${left}px`;
+    this.el.style.top = `${top}px`;
   }
 
-  // ---------- Private ----------
+  // ─── Private ──────────────────────────────────────────────────────────
 
   private createElement(): void {
     if (this.el) return;
@@ -95,12 +117,6 @@ export class StatusBar {
 
   private injectStyles(): void {
     if (document.getElementById(STYLE_ID)) return;
-
-    const link = document.createElement('link');
-    link.id = STYLE_ID;
-    link.rel = 'stylesheet';
-    // The CSS file will be bundled as a content script style
-    // For runtime, we inject the styles inline
     const style = document.createElement('style');
     style.id = STYLE_ID;
     style.textContent = getInlineStyles();
@@ -109,9 +125,8 @@ export class StatusBar {
 }
 
 /**
- * Returns the CSS as a string for injection.
- * This mirrors src/styles/vimfields.css to ensure styles are available
- * even if the CSS file isn't loaded as a separate resource.
+ * CSS injected at runtime. Mirrors src/styles/vimfields.css so the overlay
+ * works even when the stylesheet isn't loaded as a separate resource.
  */
 function getInlineStyles(): string {
   return `
@@ -119,17 +134,38 @@ function getInlineStyles(): string {
 .vimfields-block-cursor {
   position: fixed;
   pointer-events: none;
-  z-index: 2147483647;
-  background: currentColor;
-  mix-blend-mode: difference;
+  z-index: 2147483646;
+  box-sizing: border-box;
+  background: rgba(120, 170, 255, 0.42);
+  border: 1px solid rgba(120, 170, 255, 0.9);
   border-radius: 1px;
-  transition: left 50ms ease-out, top 50ms ease-out;
+  transition: left 40ms linear, top 40ms linear,
+              width 40ms linear, height 40ms linear;
 }
 
 .vimfields-block-cursor[data-mode="visual"] {
-  background: Highlight;
-  opacity: 0.4;
-  mix-blend-mode: normal;
+  background: rgba(196, 166, 245, 0.55);
+  border-color: rgba(196, 166, 245, 0.95);
+}
+
+/* Visual-mode selection highlight */
+.vimfields-selection-rect {
+  position: fixed;
+  pointer-events: none;
+  z-index: 2147483645;
+  background: rgba(196, 166, 245, 0.32);
+  border-radius: 1px;
+}
+
+/* Hidden mirror div used to measure caret position */
+.vimfields-mirror {
+  position: absolute !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+  top: 0 !important;
+  left: -9999px !important;
+  z-index: -1 !important;
+  margin: 0 !important;
 }
 
 /* Status bar */
@@ -144,13 +180,14 @@ function getInlineStyles(): string {
   font-size: 11px;
   line-height: 1.4;
   color: #e0e0e0;
-  background: rgba(30, 30, 30, 0.85);
+  background: rgba(30, 30, 30, 0.9);
   border-radius: 4px;
   pointer-events: none;
   user-select: none;
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
   white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
 }
 
 .vimfields-status-bar[data-mode="insert"] {
@@ -161,17 +198,12 @@ function getInlineStyles(): string {
   color: #c4a6f5;
 }
 
-.vimfields-status-buffer {
-  color: #888;
+.vimfields-status-mode {
+  font-weight: 600;
 }
 
-/* Visual mode selection highlight */
-.vimfields-visual-highlight {
-  position: absolute;
-  pointer-events: none;
-  background: Highlight;
-  opacity: 0.3;
-  z-index: 2147483646;
+.vimfields-status-buffer {
+  color: #ffd77a;
 }
 
 /* Measurement span (always hidden) */

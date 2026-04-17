@@ -81,7 +81,9 @@ export class FieldDetector {
     // Scan children
     if (root instanceof Element || root instanceof DocumentFragment) {
       const elements = root.querySelectorAll<HTMLElement>(
-        'input, textarea, [contenteditable="true"], [contenteditable=""]',
+        'input, textarea,' +
+          ' [contenteditable="true"], [contenteditable=""],' +
+          ' [contenteditable="plaintext-only"]',
       );
       for (const el of elements) {
         this.checkElement(el);
@@ -116,16 +118,17 @@ export class FieldDetector {
       return textTypes.includes(type);
     }
 
+    // Only treat the element that *explicitly* carries contenteditable as an
+    // editor root. Descendants inherit `isContentEditable` from an ancestor,
+    // but they aren't the focus target — attaching to them would double-fire.
+    // The IDL `contentEditable` returns "inherit" on descendants, so it's a
+    // valid complement to the attribute check (and works in jsdom, which
+    // doesn't reflect the setter back to the HTML attribute).
     const ceAttr = el.getAttribute('contenteditable');
-    if (
-      el.isContentEditable ||
-      el.contentEditable === 'true' ||
-      ceAttr === 'true' ||
-      ceAttr === ''
-    ) {
+    if (ceAttr === 'true' || ceAttr === '' || ceAttr === 'plaintext-only') {
       return true;
     }
-
-    return false;
+    const ceIdl = el.contentEditable;
+    return ceIdl === 'true' || ceIdl === 'plaintext-only';
   }
 }

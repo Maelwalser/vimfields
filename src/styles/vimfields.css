@@ -1,6 +1,7 @@
 /* ==========================================================================
    Vimfields — DOM overlay styles
-   Block cursor, status bar, visual selection, measurement helpers.
+   Block cursor, visual-mode selection, status bar, mirror helper.
+   Keep in sync with getInlineStyles() in src/dom/status-bar.ts.
    ========================================================================== */
 
 /* ---------- Block Cursor ---------- */
@@ -8,17 +9,40 @@
 .vimfields-block-cursor {
   position: fixed;
   pointer-events: none;
-  z-index: 2147483647;
-  background: currentColor;
-  mix-blend-mode: difference;
+  z-index: 2147483646;
+  box-sizing: border-box;
+  background: rgba(120, 170, 255, 0.42);
+  border: 1px solid rgba(120, 170, 255, 0.9);
   border-radius: 1px;
-  transition: left 50ms ease-out, top 50ms ease-out;
+  transition: left 40ms linear, top 40ms linear,
+              width 40ms linear, height 40ms linear;
 }
 
 .vimfields-block-cursor[data-mode="visual"] {
-  background: Highlight;
-  opacity: 0.4;
-  mix-blend-mode: normal;
+  background: rgba(196, 166, 245, 0.55);
+  border-color: rgba(196, 166, 245, 0.95);
+}
+
+/* ---------- Visual-mode selection highlight ---------- */
+
+.vimfields-selection-rect {
+  position: fixed;
+  pointer-events: none;
+  z-index: 2147483645;
+  background: rgba(196, 166, 245, 0.32);
+  border-radius: 1px;
+}
+
+/* ---------- Mirror div (caret measurement) ---------- */
+
+.vimfields-mirror {
+  position: absolute !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+  top: 0 !important;
+  left: -9999px !important;
+  z-index: -1 !important;
+  margin: 0 !important;
 }
 
 /* ---------- Status Bar ---------- */
@@ -34,13 +58,14 @@
   font-size: 11px;
   line-height: 1.4;
   color: #e0e0e0;
-  background: rgba(30, 30, 30, 0.85);
+  background: rgba(30, 30, 30, 0.9);
   border-radius: 4px;
   pointer-events: none;
   user-select: none;
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
   white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
 }
 
 .vimfields-status-bar[data-mode="insert"] {
@@ -56,36 +81,13 @@
 }
 
 .vimfields-status-buffer {
-  color: #888;
-}
-
-/* ---------- Visual Mode Selection Highlight ---------- */
-
-.vimfields-visual-highlight {
-  position: absolute;
-  pointer-events: none;
-  background: Highlight;
-  opacity: 0.3;
-  z-index: 2147483646;
-}
-
-/* ---------- Measurement Helpers ---------- */
-
-.vimfields-measure {
-  position: absolute !important;
-  visibility: hidden !important;
-  pointer-events: none !important;
-  white-space: pre !important;
+  color: #ffd77a;
 }
 
 /* ---------- Reduced Motion ---------- */
 
 @media (prefers-reduced-motion: reduce) {
   .vimfields-block-cursor {
-    transition: none;
-  }
-
-  .vimfields-status-bar {
     transition: none;
   }
 }
