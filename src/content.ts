@@ -23,6 +23,7 @@ import {
   pasteAfter, pasteBefore, joinLines,
   deleteSelection, yankSelection, changeSelection,
   caseOp, toggleCaseChar, deleteCharBefore, caseSelection,
+  lineStartOf, lineEndOf,
 } from './vim/operators';
 import type { Command } from './vim/types';
 
@@ -814,11 +815,9 @@ function handleAction(
 
     case 'o': {
       pushUndo(activeElement, text);
-      let lineEnd = text.indexOf('\n', cursor);
-      if (lineEnd === -1) lineEnd = text.length;
-      const newText = text.slice(0, lineEnd) + '\n' + text.slice(lineEnd);
-      activeAdapter.setText(newText);
-      activeAdapter.setCursorPosition(lineEnd + 1);
+      const end = lineEndOf(text, cursor);
+      const after = activeAdapter.insertLineBreak(end);
+      activeAdapter.setCursorPosition(after);
       modeManager.enterInsert();
       updateModeUI();
       break;
@@ -826,10 +825,9 @@ function handleAction(
 
     case 'O': {
       pushUndo(activeElement, text);
-      const lineStart = text.lastIndexOf('\n', cursor - 1) + 1;
-      const newText = text.slice(0, lineStart) + '\n' + text.slice(lineStart);
-      activeAdapter.setText(newText);
-      activeAdapter.setCursorPosition(lineStart);
+      const start = lineStartOf(text, cursor);
+      activeAdapter.insertLineBreak(start);
+      activeAdapter.setCursorPosition(start);
       modeManager.enterInsert();
       updateModeUI();
       break;
@@ -1035,6 +1033,38 @@ async function init(): Promise<void> {
   // without a page reload.
   document.addEventListener('keydown', handleKeyDown, true);
   fieldDetector.start();
+
+  // Diagnostic helper — call `window.__vimfieldsDebug()` from DevTools on a
+  // field that isn't behaving (e.g. Claude's chat after a Shift+Enter) to
+  // dump what the extension sees vs what the browser shows. Lets us spot DOM
+  // patterns our walker and innerText fallback both miss.
+  (globalThis as unknown as { __vimfieldsDebug?: () => unknown }).__vimfieldsDebug =
+    (): unknown => {
+      const el = (activeElement ?? document.activeElement) as HTMLElement | null;
+      if (!el) return { error: 'no active editable field' };
+      const sel = window.getSelection();
+      const r = sel && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+      return {
+        tag: el.tagName,
+        className: el.className,
+        contentEditable: (el as HTMLElement).isContentEditable,
+        outerHTMLPreview: el.outerHTML.slice(0, 1500),
+        innerText: (el as HTMLElement).innerText,
+        textContent: el.textContent,
+        adapterText: activeAdapter?.getText(),
+        adapterCursor: activeAdapter?.getCursorPosition(),
+        adapterLineCount: activeAdapter?.getLineCount(),
+        selection: r
+          ? {
+              startContainer: (r.startContainer as Node).nodeName,
+              startOffset: r.startOffset,
+              endContainer: (r.endContainer as Node).nodeName,
+              endOffset: r.endOffset,
+              collapsed: r.collapsed,
+            }
+          : null,
+      };
+    };
 }
 
 init();

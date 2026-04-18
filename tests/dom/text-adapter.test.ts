@@ -321,6 +321,244 @@ describe('ContentEditableAdapter', () => {
     expect(adapter.offsetToLineCol(6)).toEqual({ line: 1, column: 0 });
     expect(adapter.offsetToLineCol(10)).toEqual({ line: 1, column: 4 });
   });
+
+  // ---------------------------------------------------------------------------
+  // insertLineBreak — used by the `o` / `O` commands. Must work without
+  // destroying the editor's DOM or losing the newline under any pipeline.
+  // ---------------------------------------------------------------------------
+
+  it('insertLineBreak on a plain contenteditable appends a <br> at the position', () => {
+    adapter.setText('hello');
+    const after = adapter.insertLineBreak(5);
+    expect(adapter.getText()).toBe('hello\n');
+    expect(after).toBe(6);
+  });
+
+  it('insertLineBreak mid-line opens a new line, cursor on the blank line (o semantic)', () => {
+    // Simulate: text = "abc\ndef", cursor somewhere in "abc".
+    // `o` will call insertLineBreak(lineEnd=3) and setCursorPosition(after).
+    adapter.setText('abc\ndef');
+    const after = adapter.insertLineBreak(3); // end of line 1
+    expect(adapter.getText()).toBe('abc\n\ndef');
+    expect(after).toBe(4);
+  });
+
+  it('insertLineBreak at line start opens a new line above (O semantic)', () => {
+    // Text = "abc\ndef", cursor mid-line in "def" (lineStart = 4).
+    adapter.setText('abc\ndef');
+    adapter.insertLineBreak(4);
+    expect(adapter.getText()).toBe('abc\n\ndef');
+  });
+
+  it('insertLineBreak preserves j/k compatibility — lineDown lands on the new blank line', async () => {
+    const { lineDown } = await import('../../src/vim/motions.js');
+    adapter.setText('abc\ndef');
+    const after = adapter.insertLineBreak(3); // o from line 1
+    const text = adapter.getText();
+    // Cursor on the blank line (after). k should go back to 'a' (col 0, line 0),
+    // but what we really want to assert is that lineDown from the blank line
+    // reaches "def" and lineUp from "def" reaches the blank line.
+    expect(lineDown(text, after)).toBe(5); // "def" line, col 0 clamped
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Walker hardening — U+2028 / U+2029 in text nodes, trailing-break marker.
+// These exercise the patterns that rich editors (ProseMirror, Lexical) emit
+// in the wild and that our walker previously ignored.
+// ---------------------------------------------------------------------------
+
+describe('ContentEditableAdapter — walker hardening', () => {
+  let div: HTMLDivElement;
+  let adapter: ContentEditableAdapter;
+
+  beforeEach(() => {
+    div = document.createElement('div');
+    div.contentEditable = 'true';
+    document.body.appendChild(div);
+    adapter = new ContentEditableAdapter(div);
+  });
+
+  it('treats U+2028 (LINE SEPARATOR) inside a text node as \\n', () => {
+    const t = document.createTextNode('abc\u2028def');
+    div.appendChild(t);
+    expect(adapter.getText()).toBe('abc\ndef');
+    expect(adapter.getLineCount()).toBe(2);
+  });
+
+  it('treats U+2029 (PARAGRAPH SEPARATOR) inside a text node as \\n', () => {
+    const t = document.createTextNode('abc\u2029def');
+    div.appendChild(t);
+    expect(adapter.getText()).toBe('abc\ndef');
+    expect(adapter.getLineCount()).toBe(2);
+  });
+
+  it('skips <br class="ProseMirror-trailingBreak"> when counting lines', () => {
+    // Empty ProseMirror paragraphs render with a trailing-break marker purely
+    // for layout. It is not a user-visible newline.
+    div.innerHTML = '<p>hello<br class="ProseMirror-trailingBreak"></p>';
+    expect(adapter.getText()).toBe('hello');
+    expect(adapter.getLineCount()).toBe(1);
+  });
+
+  it('skips trailing-break marker even in combination with real <br>', () => {
+    div.innerHTML = '<p>hello<br>world<br class="ProseMirror-trailingBreak"></p>';
+    expect(adapter.getText()).toBe('hello\nworld');
+    expect(adapter.getLineCount()).toBe(2);
+  });
+
+  it('also skips data-trailing-break attribute variant', () => {
+    div.innerHTML = '<p>hello<br data-trailing-break=""></p>';
+    expect(adapter.getText()).toBe('hello');
+  });
+
+  it('still treats a regular <br> at the end of a paragraph as a newline', () => {
+    div.innerHTML = '<p>hello<br></p>';
+    expect(adapter.getText()).toBe('hello\n');
+  });
+
+  // -------------------------------------------------------------------------
+  // Tiptap / ProseMirror empty-paragraph pattern: after Shift+Enter the DOM
+  // is `<p>the</p><p class="is-empty"><br class="ProseMirror-trailingBreak"/></p>`.
+  // The user sees two lines. `getText()` must surface the trailing '\n' so
+  // getLineCount, j/k, and the block cursor all agree.
+  // -------------------------------------------------------------------------
+
+  it('reports trailing \\n for Tiptap empty paragraph with trailing-break marker', () => {
+    div.innerHTML = '<p>the</p><p class="is-empty"><br class="ProseMirror-trailingBreak"></p>';
+    expect(adapter.getText()).toBe('the\n');
+    expect(adapter.getLineCount()).toBe(2);
+    expect(adapter.getLine(0)).toBe('the');
+    expect(adapter.getLine(1)).toBe('');
+  });
+
+  it('consecutive empty paragraphs add one newline each', () => {
+    // <p>a</p><p></p><p>b</p> — three user-visible lines ("a", "", "b").
+    div.innerHTML = '<p>a</p><p><br class="ProseMirror-trailingBreak"></p><p>b</p>';
+    expect(adapter.getText()).toBe('a\n\nb');
+    expect(adapter.getLineCount()).toBe(3);
+  });
+
+  it('does not add a phantom trailing newline to a single-paragraph buffer', () => {
+    div.innerHTML = '<p>only line</p>';
+    expect(adapter.getText()).toBe('only line');
+    expect(adapter.getLineCount()).toBe(1);
+  });
+
+  it('cursor lands on the Tiptap blank line (reproduces the original bug)', () => {
+    // Exact DOM from Claude's Tiptap chat box after typing "the" then
+    // Shift+Enter. Selection is at (emptyParagraph, 0).
+    div.innerHTML = '<p>the</p><p class="is-empty"><br class="ProseMirror-trailingBreak"></p>';
+    const emptyP = div.children[1] as HTMLElement;
+    const sel = window.getSelection()!;
+    const range = document.createRange();
+    range.setStart(emptyP, 0);
+    range.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(range);
+
+    // text is "the\n"; cursor is at position 4 — the start of the blank
+    // second line, NOT past the end of a phantom 3-line buffer.
+    expect(adapter.getText()).toBe('the\n');
+    expect(adapter.getCursorPosition()).toBe(4);
+    expect(adapter.offsetToLineCol(4)).toEqual({ line: 1, column: 0 });
+  });
+
+  it('j from line 1 reaches the Tiptap blank line at line 2', async () => {
+    const { lineDown } = await import('../../src/vim/motions.js');
+    div.innerHTML = '<p>the</p><p class="is-empty"><br class="ProseMirror-trailingBreak"></p>';
+    const text = adapter.getText();
+    // From offset 0 (col 0 of line 1), j → col 0 of line 2 (the blank line).
+    expect(lineDown(text, 0)).toBe(4);
+  });
+
+  it('setCursorPosition(4) lands INSIDE the empty Tiptap paragraph', () => {
+    // Without empty-block anchors, offset 4 collapses to end-of-"the" and
+    // the browser caret stays on line 1. The anchor pins the cursor inside
+    // the empty <p> so Chrome renders the caret on line 2.
+    div.innerHTML = '<p>the</p><p class="is-empty"><br class="ProseMirror-trailingBreak"></p>';
+    const emptyP = div.children[1] as HTMLElement;
+    adapter.setCursorPosition(4);
+    const r = window.getSelection()!.getRangeAt(0);
+    expect(r.startContainer).toBe(emptyP);
+    expect(r.startOffset).toBe(0);
+  });
+
+  it('round-trips the cursor between text and blank-line anchor', () => {
+    div.innerHTML = '<p>the</p><p class="is-empty"><br class="ProseMirror-trailingBreak"></p>';
+    adapter.setCursorPosition(4);
+    expect(adapter.getCursorPosition()).toBe(4);
+    adapter.setCursorPosition(2);
+    expect(adapter.getCursorPosition()).toBe(2);
+  });
+
+  it('anchors also pin middle blank lines (<p>a</p><p></p><p>b</p>)', () => {
+    div.innerHTML = '<p>a</p><p class="is-empty"><br class="ProseMirror-trailingBreak"></p><p>b</p>';
+    expect(adapter.getText()).toBe('a\n\nb');
+    const middleP = div.children[1] as HTMLElement;
+    adapter.setCursorPosition(2); // offset of the middle blank line
+    const r = window.getSelection()!.getRangeAt(0);
+    expect(r.startContainer).toBe(middleP);
+    expect(r.startOffset).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TextareaAdapter.insertLineBreak
+// ---------------------------------------------------------------------------
+
+describe('TextareaAdapter — insertLineBreak', () => {
+  let textarea: HTMLTextAreaElement;
+  let adapter: TextareaAdapter;
+
+  beforeEach(() => {
+    textarea = document.createElement('textarea');
+    document.body.appendChild(textarea);
+    adapter = new TextareaAdapter(textarea);
+  });
+
+  it('inserts \\n at the position and returns position + 1', () => {
+    adapter.setText('abcdef');
+    const after = adapter.insertLineBreak(3);
+    expect(adapter.getText()).toBe('abc\ndef');
+    expect(after).toBe(4);
+    expect(adapter.getCursorPosition()).toBe(4);
+  });
+
+  it('inserts at start of buffer', () => {
+    adapter.setText('hello');
+    const after = adapter.insertLineBreak(0);
+    expect(adapter.getText()).toBe('\nhello');
+    expect(after).toBe(1);
+  });
+
+  it('inserts at end of buffer', () => {
+    adapter.setText('hello');
+    const after = adapter.insertLineBreak(5);
+    expect(adapter.getText()).toBe('hello\n');
+    expect(after).toBe(6);
+  });
+
+  it('clamps past-end position to the end of the buffer', () => {
+    adapter.setText('abc');
+    const after = adapter.insertLineBreak(99);
+    expect(adapter.getText()).toBe('abc\n');
+    expect(after).toBe(4);
+  });
+
+  it('fires input/change events so React/Vue controlled textareas stay in sync', () => {
+    let inputFired = false;
+    let changeFired = false;
+    textarea.addEventListener('input', () => { inputFired = true; });
+    textarea.addEventListener('change', () => { changeFired = true; });
+
+    adapter.setText('abc');
+    inputFired = false;
+    changeFired = false;
+    adapter.insertLineBreak(1);
+    expect(inputFired).toBe(true);
+    expect(changeFired).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

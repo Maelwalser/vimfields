@@ -16,6 +16,7 @@
  */
 
 import type { TextAdapter } from './text-adapter.js';
+import { ContentEditableAdapter } from './text-adapter.js';
 
 export type VimMode = 'normal' | 'insert' | 'visual';
 
@@ -63,6 +64,7 @@ export class CursorRenderer {
   private selectionRange: { start: number; end: number } | null = null;
   private animFrameId: number | null = null;
   private originalCaretColor: string | null = null;
+  private mutationObserver: MutationObserver | null = null;
 
   private readonly onScrollOrResize = (): void => this.update();
   private readonly onFieldMutation = (): void => this.update();
@@ -93,10 +95,30 @@ export class CursorRenderer {
     document.addEventListener('selectionchange', this.onSelectionChange);
     window.addEventListener('scroll', this.onScrollOrResize, true);
     window.addEventListener('resize', this.onScrollOrResize);
+
+    // Rich editors (ProseMirror, Lexical, Slate, CodeMirror 6) sometimes
+    // update their DOM without firing an input event we'd see here — they
+    // use a transaction pipeline that prevents the default event and
+    // re-renders manually. A MutationObserver catches every DOM change, so
+    // the block cursor stays in sync after Shift+Enter / Enter even when
+    // the editor swallows the input event.
+    if (typeof MutationObserver !== 'undefined') {
+      this.mutationObserver = new MutationObserver(this.onFieldMutation);
+      this.mutationObserver.observe(el, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      });
+    }
+
     this.update();
   }
 
   detach(): void {
+    if (this.mutationObserver) {
+      this.mutationObserver.disconnect();
+      this.mutationObserver = null;
+    }
     if (this.adapter) {
       const el = this.adapter.element;
       // Restore the original caret color (empty string clears our inline override).
@@ -320,65 +342,152 @@ export class CursorRenderer {
     return { x, y, height, charWidth };
   }
 
-  private getContentEditableCaret(el: HTMLElement, pos: number): CaretGeometry | null {
-    const text = el.innerText ?? '';
-    if (text.length === 0) {
-      const rect = el.getBoundingClientRect();
-      const cs = window.getComputedStyle(el);
+  private getContentEditableCaret(el: HTMLElement, _pos: number): CaretGeometry | null {
+    // setCursorPosition has already placed the live Selection at the right
+    // DOM position — inside a text node for positions on text, or inside an
+    // empty block (Tiptap: `<p class="is-empty"><br trailingBreak/></p>`)
+    // for blank lines. Measure off that selection directly rather than
+    // re-walking innerText, which has no entry for the blank line.
+    const doc = el.ownerDocument;
+    const win = doc.defaultView ?? window;
+    const sel = win.getSelection();
+
+    if (sel && sel.rangeCount > 0) {
+      const range = sel.getRangeAt(0);
+      const node = range.startContainer;
+      const offset = range.startOffset;
+
+      if (node.nodeType === Node.TEXT_NODE) {
+        const geom = this.measureTextNodeCaret(el, node as Text, offset);
+        if (geom) return geom;
+      }
+
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const geom = this.measureElementAnchorCaret(el, node as Element, offset);
+        if (geom) return geom;
+      }
+    }
+
+    // No usable selection — empty field, or selection not initialised yet.
+    return this.emptyFieldCaret(el);
+  }
+
+  private measureTextNodeCaret(
+    el: HTMLElement,
+    tnode: Text,
+    offset: number,
+  ): CaretGeometry | null {
+    const doc = el.ownerDocument;
+    const textLen = tnode.textContent?.length ?? 0;
+    const clamped = Math.max(0, Math.min(offset, textLen));
+
+    // Extend by one character to capture the glyph rect (x/y/width/height).
+    if (clamped < textLen) {
+      try {
+        const r = doc.createRange();
+        r.setStart(tnode, clamped);
+        r.setEnd(tnode, clamped + 1);
+        const rects = r.getClientRects();
+        if (rects.length > 0) {
+          const rect = rects[0];
+          if (rect.height > 0) {
+            return {
+              x: rect.left,
+              y: rect.top,
+              height: rect.height,
+              charWidth: rect.width > 0 ? rect.width : measureOneChar(el),
+            };
+          }
+        }
+      } catch {
+        /* fall through to collapsed measurement */
+      }
+    }
+
+    // End-of-text-node: extension isn't possible, so use a collapsed range.
+    try {
+      const r = doc.createRange();
+      r.setStart(tnode, clamped);
+      r.collapse(true);
+      const rect = r.getBoundingClientRect();
+      if (rect.height > 0 || rect.top !== 0 || rect.left !== 0) {
+        return {
+          x: rect.left,
+          y: rect.top,
+          height: rect.height || computeLineHeight(el),
+          charWidth: measureOneChar(el),
+        };
+      }
+    } catch {
+      /* fall through */
+    }
+
+    return null;
+  }
+
+  /**
+   * The selection is anchored on an element, not a text node. Happens when
+   * the cursor sits on a blank line — Tiptap's `<p class="is-empty"><br
+   * trailingBreak/></p>` has no text node, so we land on the `<p>` itself.
+   *
+   * Collapsed Range rects on element anchors are unreliable in Chrome
+   * (often `(0,0,0,0)`), so we reach for the anchor element's own
+   * `getBoundingClientRect()` — its content box is exactly where the block
+   * cursor should sit.
+   */
+  private measureElementAnchorCaret(
+    el: HTMLElement,
+    anchor: Element,
+    offset: number,
+  ): CaretGeometry | null {
+    const doc = el.ownerDocument;
+
+    // First try the Range path — Chrome sometimes gives a usable rect here.
+    try {
+      const r = doc.createRange();
+      r.setStart(anchor, offset);
+      r.collapse(true);
+      const rect = r.getBoundingClientRect();
+      if (rect.height > 0) {
+        return {
+          x: rect.left,
+          y: rect.top,
+          height: rect.height,
+          charWidth: measureOneChar(el),
+        };
+      }
+    } catch {
+      /* fall through */
+    }
+
+    // Fallback: use the anchor element itself. This always produces a real
+    // rect when the element is rendered, so the block cursor reliably
+    // appears on blank lines.
+    const rect = anchor.getBoundingClientRect();
+    if (rect.height > 0 || rect.width > 0) {
+      const cs = window.getComputedStyle(anchor);
+      const lineHeight =
+        anchor instanceof HTMLElement ? computeLineHeight(anchor) : computeLineHeight(el);
       return {
-        x: rect.left + (parseFloat(cs.paddingLeft) || 0),
-        y: rect.top + (parseFloat(cs.paddingTop) || 0),
-        height: computeLineHeight(el),
+        x: rect.left + (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.borderLeftWidth) || 0),
+        y: rect.top + (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.borderTopWidth) || 0),
+        height: lineHeight || rect.height,
         charWidth: measureOneChar(el),
       };
     }
 
-    const safePos = Math.max(0, Math.min(pos, text.length));
-    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-    let charCount = 0;
-    let node: Text | null;
-    let lastNode: Text | null = null;
-    let lastLen = 0;
-
-    while ((node = walker.nextNode() as Text | null)) {
-      const len = node.textContent?.length ?? 0;
-      lastNode = node;
-      lastLen = len;
-      if (charCount + len > safePos) {
-        const local = safePos - charCount;
-        const range = document.createRange();
-        range.setStart(node, local);
-        range.setEnd(node, Math.min(local + 1, len));
-        const rects = range.getClientRects();
-        if (rects.length > 0) {
-          const r = rects[0];
-          return {
-            x: r.left,
-            y: r.top,
-            height: r.height || computeLineHeight(el),
-            charWidth: r.width > 0 ? r.width : measureOneChar(el),
-          };
-        }
-      }
-      charCount += len;
-    }
-
-    // End of text: anchor at the end of the last text node.
-    if (lastNode) {
-      const range = document.createRange();
-      range.setStart(lastNode, lastLen);
-      range.collapse(true);
-      const rects = range.getClientRects();
-      if (rects.length > 0) {
-        return {
-          x: rects[0].left,
-          y: rects[0].top,
-          height: rects[0].height || computeLineHeight(el),
-          charWidth: measureOneChar(el),
-        };
-      }
-    }
     return null;
+  }
+
+  private emptyFieldCaret(el: HTMLElement): CaretGeometry {
+    const rect = el.getBoundingClientRect();
+    const cs = window.getComputedStyle(el);
+    return {
+      x: rect.left + (parseFloat(cs.paddingLeft) || 0),
+      y: rect.top + (parseFloat(cs.paddingTop) || 0),
+      height: computeLineHeight(el),
+      charWidth: measureOneChar(el),
+    };
   }
 
   private getSelectionRects(lo: number, hi: number): Rect[] {
@@ -457,19 +566,65 @@ export class CursorRenderer {
   }
 
   private getContentEditableSelectionRects(el: HTMLElement, lo: number, hi: number): Rect[] {
-    const start = offsetToNodeOffset(el, lo);
-    const end = offsetToNodeOffset(el, hi);
-    if (!start || !end) return [];
+    // Use the adapter's own offset→DOM mapping so selection rendering stays
+    // in the same coordinate space as getText() / getCursorPosition(). That
+    // includes empty-block anchors (Tiptap's blank <p>), so selections that
+    // span a blank line produce a highlight on that line instead of
+    // collapsing to zero.
+    const adapter = this.adapter;
+    if (!(adapter instanceof ContentEditableAdapter)) return [];
+
+    const start = adapter.offsetToDomPosition(lo);
+    const end = adapter.offsetToDomPosition(hi);
+
     try {
-      const range = document.createRange();
+      const range = el.ownerDocument.createRange();
       range.setStart(start.node, start.offset);
       range.setEnd(end.node, end.offset);
-      return Array.from(range.getClientRects(), (r) => ({
+      const rects = Array.from(range.getClientRects(), (r) => ({
         left: r.left,
         top: r.top,
         width: r.width,
         height: r.height,
       }));
+
+      // A selection that ends at an empty-block anchor (blank line in
+      // Tiptap) gets no rect for that trailing blank line — the Range ends
+      // at `(<p class="is-empty">, 0)` and the <p> contributes no visible
+      // content of its own. Synthesise a rect from the anchor element so
+      // the user sees the blank line highlighted like in real Vim.
+      if (end.node.nodeType === Node.ELEMENT_NODE && hi > lo) {
+        const anchor = end.node as Element;
+        const elRect = anchor.getBoundingClientRect();
+        if (elRect.height > 0) {
+          const cs = window.getComputedStyle(anchor);
+          const lineHeight =
+            anchor instanceof HTMLElement
+              ? computeLineHeight(anchor)
+              : computeLineHeight(el);
+          const x =
+            elRect.left +
+            (parseFloat(cs.paddingLeft) || 0) +
+            (parseFloat(cs.borderLeftWidth) || 0);
+          const y =
+            elRect.top +
+            (parseFloat(cs.paddingTop) || 0) +
+            (parseFloat(cs.borderTopWidth) || 0);
+          const alreadyCovered = rects.some(
+            (r) => Math.abs(r.top - y) < 1 && r.width > 0,
+          );
+          if (!alreadyCovered) {
+            rects.push({
+              left: x,
+              top: y,
+              width: Math.max(measureOneChar(el), 6),
+              height: lineHeight || elRect.height,
+            });
+          }
+        }
+      }
+
+      return rects;
     } catch {
       return [];
     }
@@ -557,30 +712,6 @@ function syncMirrorToField(
     style.wordWrap = 'break-word';
     (style as unknown as Record<string, string>)['overflowWrap'] = 'break-word';
   }
-}
-
-function offsetToNodeOffset(
-  el: HTMLElement,
-  offset: number,
-): { node: Node; offset: number } | null {
-  const text = el.innerText ?? '';
-  const clamped = Math.max(0, Math.min(offset, text.length));
-  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-  let count = 0;
-  let last: Text | null = null;
-  let lastLen = 0;
-  let node: Text | null;
-  while ((node = walker.nextNode() as Text | null)) {
-    const len = node.textContent?.length ?? 0;
-    if (count + len >= clamped) {
-      return { node, offset: clamped - count };
-    }
-    count += len;
-    last = node;
-    lastLen = len;
-  }
-  if (last) return { node: last, offset: lastLen };
-  return { node: el, offset: 0 };
 }
 
 function measureOneChar(el: HTMLElement): number {

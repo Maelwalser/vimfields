@@ -33,6 +33,16 @@ export interface TextAdapter {
   /** Get the text content of a specific line (0-indexed). */
   getLine(line: number): string;
 
+  /**
+   * Insert a single line break at `position` and return the cursor offset
+   * immediately after the inserted break. For rich-text contenteditable
+   * editors (ProseMirror, Lexical) this uses the same path as Shift+Enter
+   * so the editor's own model stays in sync.
+   *
+   * Single-line adapters (InputAdapter) are a no-op and return `position`.
+   */
+  insertLineBreak(position: number): number;
+
   dispose(): void;
 }
 
@@ -129,6 +139,10 @@ export class InputAdapter implements TextAdapter {
 
   getLine(_line: number): string {
     return this.element.value;
+  }
+
+  insertLineBreak(position: number): number {
+    return position;
   }
 
   dispose(): void {
@@ -228,6 +242,17 @@ export class TextareaAdapter implements TextAdapter {
     return lines[clamped];
   }
 
+  insertLineBreak(position: number): number {
+    const current = this.element.value;
+    const clamped = Math.max(0, Math.min(position, current.length));
+    const next = current.slice(0, clamped) + '\n' + current.slice(clamped);
+    setNativeValue(this.element, next);
+    const after = clamped + 1;
+    this.element.setSelectionRange(after, after);
+    dispatchInputEvents(this.element, '\n');
+    return after;
+  }
+
   dispose(): void {
     // No cleanup needed
   }
@@ -248,6 +273,22 @@ const BLOCK_TAGS = new Set([
   'HGROUP', 'HR', 'LI', 'MAIN', 'NAV', 'OL', 'P', 'PRE', 'SECTION',
   'TABLE', 'TBODY', 'TD', 'TFOOT', 'TH', 'THEAD', 'TR', 'UL',
 ]);
+
+// Some editors render an empty block with a <br class="ProseMirror-trailingBreak">
+// (or similar) purely to give the line height. That <br> is invisible to the
+// user's cursor and counting it produces phantom newlines in getText().
+function isTrailingBreakMarker(el: Element): boolean {
+  if (el.tagName !== 'BR') return false;
+  const cls = el.getAttribute('class') ?? '';
+  return /\btrailingBreak\b/.test(cls) || el.hasAttribute('data-trailing-break');
+}
+
+// Editors can smuggle line breaks into text nodes using Unicode line/paragraph
+// separator characters (U+2028 / U+2029). Treat them exactly like '\n' so the
+// cursor math and motions see them as line boundaries.
+function normalizeLineSeparators(s: string): string {
+  return s.replace(/[\u2028\u2029]/g, '\n');
+}
 
 function isBlockElement(el: Element): boolean {
   if (BLOCK_TAGS.has(el.tagName)) return true;
@@ -281,26 +322,58 @@ function isBlockElement(el: Element): boolean {
  * makes j/k work across Shift+Enter: both sides agree that the newline
  * exists and sits at the same offset.
  */
+/**
+ * Build a plain-text view of a contenteditable, mapping each Text node to
+ * its offset in the final string.
+ *
+ * The walker emits one '\n' between sibling block-level boxes, one '\n' per
+ * <br> (skipping ProseMirror-trailingBreak markers), and flushes any pending
+ * separator at the end — so a trailing empty <p> (Tiptap's canonical empty-
+ * line pattern, `<p class="is-empty"><br class="ProseMirror-trailingBreak"/></p>`)
+ * produces the trailing "\n" that makes j/k and getLineCount agree with what
+ * the user sees.
+ *
+ * Consecutive empty blocks accumulate: `<p>a</p><p></p><p>b</p>` becomes
+ * "a\n\nb" (three lines) because each block's pre-visit increments the
+ * pending counter even when the block emits no text of its own.
+ *
+ * We intentionally do not use `element.innerText` — for block-styled editors
+ * like Tiptap / ProseMirror it overcounts empty paragraphs (each renders with
+ * vertical margin that innerText turns into an extra '\n'), which produced
+ * phantom blank lines in an earlier version of this code.
+ */
+interface EmptyBlockAnchor {
+  element: Element;
+  start: number;
+}
+
 function computeTextView(root: Element): {
   text: string;
   textNodes: Array<{ node: Text; start: number }>;
+  emptyAnchors: EmptyBlockAnchor[];
 } {
   const textNodes: Array<{ node: Text; start: number }> = [];
+  // Empty blocks (e.g. Tiptap's `<p class="is-empty"><br ...trailingBreak/></p>`)
+  // have no text node — they represent blank lines. Record them here so
+  // setCursorPosition() can land inside the right paragraph and
+  // rangeToOffset() can recognise when the selection sits in one.
+  const emptyAnchors: EmptyBlockAnchor[] = [];
   let text = '';
-  let pendingNewline = false;
+  let pendingNewlines = 0;
   let emittedAny = false;
 
   const flushPending = (): void => {
-    if (pendingNewline) {
+    while (pendingNewlines > 0) {
       text += '\n';
-      pendingNewline = false;
+      pendingNewlines--;
     }
   };
 
   const visit = (node: Node): void => {
     if (node.nodeType === Node.TEXT_NODE) {
-      const content = (node as Text).textContent ?? '';
-      if (content.length === 0) return;
+      const raw = (node as Text).textContent ?? '';
+      if (raw.length === 0) return;
+      const content = normalizeLineSeparators(raw);
       flushPending();
       textNodes.push({ node: node as Text, start: text.length });
       text += content;
@@ -312,6 +385,7 @@ function computeTextView(root: Element): {
 
     const el = node as Element;
     if (el.tagName === 'BR') {
+      if (isTrailingBreakMarker(el)) return;
       flushPending();
       text += '\n';
       emittedAny = true;
@@ -319,22 +393,32 @@ function computeTextView(root: Element): {
     }
 
     const treatAsBlock = el !== root && isBlockElement(el);
+    const textLenBefore = text.length;
 
     if (treatAsBlock && emittedAny) {
-      pendingNewline = true;
+      pendingNewlines++;
     }
 
     for (const child of Array.from(el.childNodes)) {
       visit(child);
     }
 
-    if (treatAsBlock && emittedAny) {
-      pendingNewline = true;
+    if (treatAsBlock && emittedAny && text.length === textLenBefore) {
+      // This block produced no text. Its line starts at the offset the
+      // NEXT flush would write — i.e. current text plus still-pending \n's.
+      // setCursorPosition(that offset) should land INSIDE this empty block
+      // so the browser caret is visible on the blank line.
+      emptyAnchors.push({ element: el, start: text.length + pendingNewlines });
     }
   };
 
   visit(root);
-  return { text, textNodes };
+  // Trailing empty blocks leave pending newlines unflushed. Those represent
+  // blank lines the user can see and edit (Tiptap's empty <p> with
+  // trailing-break marker), so emit them so cursor math lines up.
+  flushPending();
+
+  return { text, textNodes, emptyAnchors };
 }
 
 export class ContentEditableAdapter implements TextAdapter {
@@ -469,131 +553,128 @@ export class ContentEditableAdapter implements TextAdapter {
     return lines[clamped];
   }
 
+  insertLineBreak(position: number): number {
+    // Place the selection where the break should go, then ask the browser /
+    // editor to insert a line break using the same input pipeline Shift+Enter
+    // travels through. execCommand('insertLineBreak') fires a beforeinput with
+    // inputType: 'insertLineBreak', which ProseMirror/Lexical handle via their
+    // own transaction — setText('insertText', "\n") would strip the newline.
+    this.setCursorPosition(position);
+
+    const doc = this.element.ownerDocument;
+    let inserted = false;
+    try {
+      inserted = doc.execCommand('insertLineBreak');
+    } catch {
+      inserted = false;
+    }
+
+    if (!inserted) {
+      const sel = doc.defaultView?.getSelection();
+      if (sel && sel.rangeCount > 0) {
+        const range = sel.getRangeAt(0);
+        const br = doc.createElement('br');
+        range.deleteContents();
+        range.insertNode(br);
+        dispatchInputEvents(this.element, null);
+        inserted = true;
+      }
+    }
+
+    if (!inserted) return position;
+
+    // Inserting a '\n'-equivalent at `position` shifts everything after it by
+    // exactly one offset. The cursor belongs at `position + 1`. We set it
+    // explicitly instead of trusting the browser's post-insert Range, which
+    // can land in an ambiguous gap between block boundaries.
+    const after = position + 1;
+    this.setCursorPosition(after);
+    return after;
+  }
+
   dispose(): void {
     // No cleanup needed
+  }
+
+  /**
+   * Public accessor for mapping a linear offset to a DOM { node, offset }
+   * pair in the adapter's coordinate space. CursorRenderer uses this to
+   * stay consistent with getText() / getCursorPosition() when drawing
+   * overlays (notably the visual-mode selection rects). Without it the
+   * renderer would have to re-implement the walker + empty-block anchor
+   * logic and get blank-line positions wrong.
+   */
+  offsetToDomPosition(offset: number): { node: Node; offset: number } {
+    return this.offsetToNodePosition(offset);
   }
 
   // ---- Private helpers for Selection/Range <-> offset conversion ----
 
   /**
-   * Walk the subtree, accumulating the same offset that computeTextView()
-   * produces, until we reach the Selection endpoint. This keeps cursor
-   * coordinates aligned with getText() across <br>s and block boundaries,
-   * which is what Shift+Enter produces in Claude/Gemini-style editors.
+   * Convert a DOM Range endpoint to an offset in getText()'s coordinate
+   * space. Uses the Text-node → offset map produced by computeTextView(),
+   * which may come from either the DOM walker or from `innerText` matching.
+   * That shared mapping is what keeps getText(), getCursorPosition() and
+   * offsetToNodePosition() all in agreement even when a rich editor's DOM
+   * (ProseMirror, Lexical, Slate, Tiptap) contains line breaks the walker
+   * alone doesn't recognize.
    */
   private rangeToOffset(range: Range, useStart: boolean): number {
     const targetNode = useStart ? range.startContainer : range.endContainer;
     const targetOffset = useStart ? range.startOffset : range.endOffset;
     const root = this.element;
+    const { text, textNodes, emptyAnchors } = computeTextView(root);
 
-    // Degenerate case: selection is anchored directly on the contenteditable.
-    if (targetNode === root) {
-      const { text, textNodes } = computeTextView(root);
-      if (targetOffset <= 0) return 0;
-      if (targetOffset >= root.childNodes.length) return text.length;
-      // Find the offset at the boundary just before child[targetOffset].
-      const child = root.childNodes[targetOffset];
+    // Target is a text node — add the in-node offset to the node's base.
+    if (targetNode.nodeType === Node.TEXT_NODE) {
       for (const entry of textNodes) {
-        if (child.contains(entry.node) || child === entry.node) {
-          return entry.start;
+        if (entry.node === targetNode) {
+          const content = entry.node.textContent ?? '';
+          const clamped = Math.max(0, Math.min(targetOffset, content.length));
+          return entry.start + clamped;
         }
       }
-      return text.length;
+      return 0;
     }
 
-    let offset = 0;
-    let emittedAny = false;
-    let pendingNewline = false;
-    let stopped = false;
-    let stoppedAt = 0;
-
-    const flushPending = (): void => {
-      if (pendingNewline) {
-        offset += 1;
-        pendingNewline = false;
+    // Selection is anchored on an element. If that element is an empty-block
+    // anchor (e.g. a blank line's <p> in Tiptap), or the selection is on a
+    // descendant that lives inside one, use the anchor's offset directly.
+    // This is what lets j/k, Shift+Enter cursor tracking, and the block
+    // cursor overlay all agree that the caret is on the blank line.
+    for (const anchor of emptyAnchors) {
+      if (anchor.element === targetNode || anchor.element.contains(targetNode)) {
+        return anchor.start;
       }
-    };
+    }
 
-    const visit = (node: Node): void => {
-      if (stopped) return;
+    // Otherwise walk through text nodes and land on the first one at or
+    // after the target position.
+    const doc = root.ownerDocument;
+    const probe = doc.createRange();
+    try {
+      probe.setStart(targetNode, targetOffset);
+      probe.setEnd(targetNode, targetOffset);
+    } catch {
+      return 0;
+    }
 
-      if (node.nodeType === Node.TEXT_NODE) {
-        const content = (node as Text).textContent ?? '';
-        if (node === targetNode) {
-          flushPending();
-          const clampedTargetOffset = Math.max(
-            0,
-            Math.min(targetOffset, content.length),
-          );
-          if (clampedTargetOffset > 0) {
-            offset += clampedTargetOffset;
-            emittedAny = true;
-          }
-          stoppedAt = offset;
-          stopped = true;
-          return;
-        }
-        if (content.length === 0) return;
-        flushPending();
-        offset += content.length;
-        emittedAny = true;
-        return;
+    for (const entry of textNodes) {
+      let cmp: number;
+      try {
+        cmp = probe.comparePoint(entry.node, 0);
+      } catch {
+        continue;
       }
-
-      if (node.nodeType !== Node.ELEMENT_NODE) return;
-
-      const el = node as Element;
-      if (el.tagName === 'BR') {
-        if (node === targetNode) {
-          if (targetOffset <= 0) {
-            flushPending();
-          } else {
-            flushPending();
-            offset += 1;
-            emittedAny = true;
-          }
-          stoppedAt = offset;
-          stopped = true;
-          return;
-        }
-        flushPending();
-        offset += 1;
-        emittedAny = true;
-        return;
+      if (cmp >= 0) {
+        // This text node starts at or after the target — land here so the
+        // cursor sits at the start of the next visible text.
+        return entry.start;
       }
+    }
 
-      const treatAsBlock = el !== root && isBlockElement(el);
-
-      if (treatAsBlock && emittedAny) {
-        pendingNewline = true;
-      }
-
-      const children = Array.from(el.childNodes);
-      for (let i = 0; i < children.length; i++) {
-        if (node === targetNode && i === targetOffset) {
-          flushPending();
-          stoppedAt = offset;
-          stopped = true;
-          return;
-        }
-        visit(children[i]);
-        if (stopped) return;
-      }
-
-      if (node === targetNode && targetOffset === children.length) {
-        flushPending();
-        stoppedAt = offset;
-        stopped = true;
-        return;
-      }
-
-      if (treatAsBlock && emittedAny) {
-        pendingNewline = true;
-      }
-    };
-
-    visit(root);
-    return stopped ? stoppedAt : offset;
+    // All text nodes come before the target — cursor is past the last one.
+    return text.length;
   }
 
   /**
@@ -602,8 +683,19 @@ export class ContentEditableAdapter implements TextAdapter {
    */
   private offsetToNodePosition(offset: number): { node: Node; offset: number } {
     const root = this.element;
-    const { text, textNodes } = computeTextView(root);
+    const { text, textNodes, emptyAnchors } = computeTextView(root);
     const clamped = Math.max(0, Math.min(offset, text.length));
+
+    // Blank-line positions (empty <p> in Tiptap, empty <div> in other editors)
+    // have no text node. Land inside the anchor element so the browser caret
+    // renders on the correct line. Without this, setCursorPosition(4) for
+    // text "the\n" falls back to end-of-"the" and the cursor visually stays
+    // on line 1 even though our offset math says line 2.
+    for (const anchor of emptyAnchors) {
+      if (anchor.start === clamped) {
+        return { node: anchor.element, offset: 0 };
+      }
+    }
 
     // Prefer placing the cursor inside a text node so framework editors
     // (ProseMirror/Lexical) treat the selection as a "real" text position.
@@ -629,7 +721,12 @@ export class ContentEditableAdapter implements TextAdapter {
       }
     }
 
-    // No text nodes at all, or offset past the last text node.
+    // Past all text nodes with no exact anchor match — prefer the last
+    // anchor (trailing blank lines) over the end of the last text node.
+    if (emptyAnchors.length > 0) {
+      const last = emptyAnchors[emptyAnchors.length - 1];
+      return { node: last.element, offset: 0 };
+    }
     if (textNodes.length > 0) {
       const last = textNodes[textNodes.length - 1];
       return {

@@ -5,12 +5,12 @@ import { Registers } from './registers.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
-function lineStartOf(text: string, pos: number): number {
+export function lineStartOf(text: string, pos: number): number {
   const prev = text.lastIndexOf('\n', pos - 1);
   return prev === -1 ? 0 : prev + 1;
 }
 
-function lineEndOf(text: string, pos: number): number {
+export function lineEndOf(text: string, pos: number): number {
   const next = text.indexOf('\n', pos);
   return next === -1 ? text.length : next;
 }
@@ -86,14 +86,59 @@ export function deleteOp(
   registers.recordDelete(deleted, linewise, register);
 
   const newText = text.slice(0, start) + text.slice(end);
+
+  if (linewise) {
+    // Vim moves the cursor to the first non-blank of the line that now
+    // occupies the deleted line's position (or the previous line if the
+    // last line was deleted). Do NOT clamp to the last char of the line
+    // above — that "teleport to end of previous line" bug is what makes
+    // dd feel unlike a real code-line delete.
+    return { text: newText, cursor: firstNonBlankAfterDelete(newText, start) };
+  }
+
   let newCursor = start;
-  // Clamp cursor
   if (newText.length > 0 && newCursor >= newText.length) {
     newCursor = newText.length - 1;
   }
   if (newText.length === 0) newCursor = 0;
 
   return { text: newText, cursor: newCursor };
+}
+
+/**
+ * After a linewise delete that removed `[start, end)`, pick the cursor
+ * position Vim would use:
+ *   • The line at `start` if it still exists (i.e. a middle/first line was
+ *     deleted) — land on its first non-blank character.
+ *   • Otherwise the previous line (the last line was deleted) — same rule.
+ *   • Empty buffer → 0.
+ */
+function firstNonBlankAfterDelete(newText: string, deletedLineStart: number): number {
+  if (newText.length === 0) return 0;
+
+  let lineStart: number;
+  if (deletedLineStart < newText.length) {
+    // A line still lives at this offset — that's the "next" line after the
+    // delete, which Vim moves to.
+    lineStart = deletedLineStart;
+  } else {
+    // Deleted the last line; fall back to the new last line.
+    lineStart = lineStartOf(newText, newText.length - 1);
+  }
+
+  let pos = lineStart;
+  while (
+    pos < newText.length &&
+    newText[pos] !== '\n' &&
+    (newText[pos] === ' ' || newText[pos] === '\t')
+  ) {
+    pos++;
+  }
+  // All whitespace (or empty line) → stay at line start.
+  if (pos >= newText.length || newText[pos] === '\n') {
+    return lineStart;
+  }
+  return pos;
 }
 
 /** c — change (delete then enter insert) */

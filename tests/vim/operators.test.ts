@@ -41,6 +41,34 @@ describe('operators', () => {
       expect(result.cursor).toBe(6);
     });
 
+    it('dd on the last line lands cursor on the new last line, first non-blank', () => {
+      // Reproduces the "teleport to end of previous line" bug: before the
+      // fix, dd on "world" left the cursor on 'o' (last char of "hello"),
+      // not at the start of "hello" like real Vim.
+      const cmd: Command = { count: 1, operator: 'd', motion: null, linewise: true };
+      const result = deleteOp('hello\nworld', 7, cmd, reg);
+      expect(result.text).toBe('hello\n');
+      expect(result.cursor).toBe(0);
+    });
+
+    it('dd on a middle line lands cursor at first non-blank of next line', () => {
+      const cmd: Command = { count: 1, operator: 'd', motion: null, linewise: true };
+      const result = deleteOp('one\n  two\nthree', 4, cmd, reg);
+      expect(result.text).toBe('one\nthree');
+      // The line that replaced "  two" is "three" — cursor goes to its
+      // first non-blank, which is 't' at offset 4.
+      expect(result.cursor).toBe(4);
+    });
+
+    it('dd preserves indentation behaviour — first non-blank, not column 0', () => {
+      const cmd: Command = { count: 1, operator: 'd', motion: null, linewise: true };
+      const result = deleteOp('one\ntwo\n    indented', 4, cmd, reg);
+      // After deleting "two", "    indented" slides up. First non-blank
+      // is 'i' — four spaces in from the line start.
+      expect(result.text).toBe('one\n    indented');
+      expect(result.cursor).toBe(8);
+    });
+
     it('d$ deletes to end of line', () => {
       const cmd: Command = { count: 1, operator: 'd', motion: '$', linewise: false };
       const result = deleteOp('hello world', 5, cmd, reg);
