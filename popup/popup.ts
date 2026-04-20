@@ -11,6 +11,9 @@ const enabledToggle = document.getElementById(
 const escapeRemapInput = document.getElementById(
   "escape-remap",
 ) as HTMLInputElement;
+const monospaceToggle = document.getElementById(
+  "monospace-toggle",
+) as HTMLInputElement;
 const chipList = document.getElementById(
   "disabled-sites-list",
 ) as HTMLUListElement;
@@ -104,6 +107,7 @@ function renderCurrentSite(): void {
 function render(): void {
   enabledToggle.checked = config.enabled;
   escapeRemapInput.value = config.escapeRemap;
+  monospaceToggle.checked = config.useMonospaceFont;
   renderChips();
   renderCurrentSite();
 }
@@ -180,6 +184,10 @@ async function init(): Promise<void> {
     const value =
       escapeRemapInput.value.trim() || DEFAULT_CONFIG.escapeRemap;
     persist({ ...config, escapeRemap: value });
+  });
+
+  monospaceToggle.addEventListener("change", () => {
+    persist({ ...config, useMonospaceFont: monospaceToggle.checked });
   });
 
   addForm.addEventListener("submit", (e) => {

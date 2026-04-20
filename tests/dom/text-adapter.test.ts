@@ -5,6 +5,8 @@ import {
   TextareaAdapter,
   ContentEditableAdapter,
   createTextAdapter,
+  applyMonospaceFont,
+  restoreFont,
 } from '../../src/dom/text-adapter.js';
 
 // ---------------------------------------------------------------------------
@@ -501,6 +503,190 @@ describe('ContentEditableAdapter — walker hardening', () => {
     expect(r.startContainer).toBe(middleP);
     expect(r.startOffset).toBe(0);
   });
+
+  // -------------------------------------------------------------------------
+  // Framework-specific sentinels beyond ProseMirror.
+  // -------------------------------------------------------------------------
+
+  it('skips Slate zero-width trailing break (<br data-slate-zero-width="z">)', () => {
+    // Slate marks an empty-block terminator with this attribute. Like the
+    // ProseMirror trailing-break marker, it's structural and not a newline.
+    div.innerHTML = '<div>hello<br data-slate-zero-width="z"></div>';
+    expect(adapter.getText()).toBe('hello');
+    expect(adapter.getLineCount()).toBe(1);
+  });
+
+  it('treats Lexical <br data-lexical-linebreak> as a real newline', () => {
+    // Lexical emits this attribute on the <br> produced by Shift+Enter.
+    // It IS a user-visible break, so the walker must count it.
+    div.innerHTML = '<p>hello<br data-lexical-linebreak="true">world</p>';
+    expect(adapter.getText()).toBe('hello\nworld');
+    expect(adapter.getLineCount()).toBe(2);
+  });
+
+  it('does not insert a phantom newline for inline contenteditable=false widgets', () => {
+    // Chat UIs render @mentions and file chips as inline spans with
+    // contenteditable="false". They would otherwise look like block boundaries
+    // to our walker if their display styling was block-ish.
+    div.innerHTML = 'Hi <span contenteditable="false" data-mention="alice">@alice</span> there';
+    // Whether the chip's textContent appears in getText depends on styling,
+    // but the critical invariant is that no extra \n appears around it.
+    expect(adapter.getText()).not.toContain('\n');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deleteBlockAtCursor — the linewise-dd primitive used by chat editors where
+// the text-diff path is ambiguous across consecutive blank lines.
+// ---------------------------------------------------------------------------
+
+describe('ContentEditableAdapter — deleteBlockAtCursor', () => {
+  let div: HTMLDivElement;
+  let adapter: ContentEditableAdapter;
+
+  beforeEach(() => {
+    div = document.createElement('div');
+    div.contentEditable = 'true';
+    document.body.appendChild(div);
+    adapter = new ContentEditableAdapter(div);
+  });
+
+  const placeCaret = (node: Node, offset: number): void => {
+    const sel = window.getSelection()!;
+    const range = document.createRange();
+    range.setStart(node, offset);
+    range.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  };
+
+  it('removes exactly one empty <p> out of several without touching siblings', () => {
+    // ProseMirror shape: four paragraphs where the middle two are empty.
+    // Buffer is "a\n\n\nb" — text + block-boundary + empty + block-boundary +
+    // empty + block-boundary + text. Cursor on the second empty paragraph.
+    div.innerHTML =
+      '<p>a</p>' +
+      '<p class="is-empty"><br class="ProseMirror-trailingBreak"></p>' +
+      '<p class="is-empty"><br class="ProseMirror-trailingBreak"></p>' +
+      '<p>b</p>';
+    expect(adapter.getText()).toBe('a\n\n\nb');
+
+    const targetEmptyP = div.children[2] as HTMLElement;
+    placeCaret(targetEmptyP, 0);
+
+    const ok = adapter.deleteBlockAtCursor();
+    expect(ok).toBe(true);
+    // Exactly three blocks remain.
+    expect(div.children.length).toBe(3);
+    // One blank paragraph gone: was "a\n\n\nb", now "a\n\nb".
+    expect(adapter.getText()).toBe('a\n\nb');
+  });
+
+  it('removes the cursor\'s own <p> when there is regular content in it', () => {
+    div.innerHTML = '<p>alpha</p><p>beta</p><p>gamma</p>';
+    const betaP = div.children[1] as HTMLElement;
+    placeCaret(betaP.firstChild!, 2);
+
+    expect(adapter.deleteBlockAtCursor()).toBe(true);
+    expect(div.children.length).toBe(2);
+    expect(adapter.getText()).toBe('alpha\ngamma');
+  });
+
+  it('refuses when only one block exists — caller falls back to text diff', () => {
+    div.innerHTML = '<p>only</p>';
+    placeCaret(div.children[0].firstChild!, 1);
+    expect(adapter.deleteBlockAtCursor()).toBe(false);
+    expect(div.children.length).toBe(1);
+  });
+
+  it('refuses when the editor has no block structure (flat <br> separators)', () => {
+    // Manually flattened plain-contenteditable content: no <p>, just text
+    // and <br>s. There is no block ancestor to target, so the primitive
+    // declines and the caller uses the offset-diff path.
+    div.innerHTML = 'hello<br>world';
+    placeCaret(div.firstChild!, 2);
+    expect(adapter.deleteBlockAtCursor()).toBe(false);
+  });
+
+  it('places the caret at the start of the surviving previous sibling', () => {
+    div.innerHTML = '<p>one</p><p>two</p><p>three</p>';
+    const twoP = div.children[1] as HTMLElement;
+    placeCaret(twoP.firstChild!, 1);
+
+    adapter.deleteBlockAtCursor();
+
+    // Cursor should be at offset 0 of "one" (the previous sibling) —
+    // getCursorPosition returns the flat offset in the new text ("one\nthree").
+    expect(adapter.getCursorPosition()).toBe(0);
+  });
+
+  it('falls back to the next sibling when cursor was in the first block', () => {
+    div.innerHTML = '<p>first</p><p>second</p>';
+    const firstP = div.children[0] as HTMLElement;
+    placeCaret(firstP.firstChild!, 3);
+
+    adapter.deleteBlockAtCursor();
+
+    expect(adapter.getText()).toBe('second');
+    // Caret now at start of the surviving "second" paragraph.
+    expect(adapter.getCursorPosition()).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setText — destructive-rebuild guard. On a focused framework editor the
+// rebuild path would replace the editor's <p> structure with a flat <br> soup.
+// ---------------------------------------------------------------------------
+
+describe('ContentEditableAdapter — setText focused-editor guard', () => {
+  let div: HTMLDivElement;
+  let adapter: ContentEditableAdapter;
+
+  beforeEach(() => {
+    div = document.createElement('div');
+    div.contentEditable = 'true';
+    document.body.appendChild(div);
+    adapter = new ContentEditableAdapter(div);
+  });
+
+  it('does not tear down <p> structure when the diff path fails on a focused editor', () => {
+    // Simulate a framework editor: the DOM is <p>-structured, the element
+    // is focused, and there is a selection anchored inside it. We then call
+    // setText with a value the diff path cannot achieve (jsdom's execCommand
+    // is a no-op, so applyTextViaDiff returns false). The old behaviour
+    // wiped the <p>s; the new behaviour leaves them.
+    div.setAttribute('tabindex', '0');
+    div.innerHTML = '<p>keep me</p><p>and me</p>';
+    div.focus();
+    const firstText = (div.children[0] as HTMLElement).firstChild!;
+    const sel = window.getSelection()!;
+    const range = document.createRange();
+    range.setStart(firstText, 2);
+    range.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(range);
+
+    const pCountBefore = div.querySelectorAll('p').length;
+
+    adapter.setText('totally different content');
+
+    const pCountAfter = div.querySelectorAll('p').length;
+    expect(pCountAfter).toBe(pCountBefore);
+    // Inner markup should not have been reduced to bare text + <br>s.
+    expect(div.querySelector('br')).toBeNull();
+  });
+
+  it('still rebuilds when the element is not focused (jsdom init path)', () => {
+    // With no focus we have no framework editor to protect — the rebuild
+    // path is the only way to put text into a plain contenteditable.
+    div.innerHTML = '<p>old</p>';
+    // Ensure not focused
+    (document.activeElement as HTMLElement | null)?.blur();
+
+    adapter.setText('line1\nline2');
+
+    expect(adapter.getText()).toBe('line1\nline2');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -632,5 +818,65 @@ describe('createTextAdapter', () => {
     input.type = 'number';
     const adapter = createTextAdapter(input);
     expect(adapter).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Monospace font override
+// ---------------------------------------------------------------------------
+
+describe('applyMonospaceFont / restoreFont', () => {
+  it('sets font-family with !important and restores empty on clean element', () => {
+    const el = document.createElement('textarea');
+    document.body.appendChild(el);
+
+    applyMonospaceFont(el);
+    expect(el.style.getPropertyValue('font-family')).toContain('JetBrains Mono');
+    expect(el.style.getPropertyPriority('font-family')).toBe('important');
+    expect(el.style.getPropertyValue('font-variant-ligatures')).toBe('none');
+    expect(el.style.getPropertyValue('font-feature-settings')).toBe('normal');
+
+    restoreFont(el);
+    expect(el.style.getPropertyValue('font-family')).toBe('');
+    expect(el.style.getPropertyValue('font-variant-ligatures')).toBe('');
+    expect(el.style.getPropertyValue('font-feature-settings')).toBe('');
+  });
+
+  it('preserves existing inline font styles across apply/restore', () => {
+    const el = document.createElement('textarea');
+    el.style.setProperty('font-family', 'Georgia, serif', 'important');
+    el.style.setProperty('font-variant-ligatures', 'common-ligatures', '');
+    document.body.appendChild(el);
+
+    applyMonospaceFont(el);
+    expect(el.style.getPropertyValue('font-family')).toContain('JetBrains Mono');
+    expect(el.style.getPropertyPriority('font-family')).toBe('important');
+
+    restoreFont(el);
+    expect(el.style.getPropertyValue('font-family')).toBe('Georgia, serif');
+    expect(el.style.getPropertyPriority('font-family')).toBe('important');
+    expect(el.style.getPropertyValue('font-variant-ligatures')).toBe('common-ligatures');
+    expect(el.style.getPropertyPriority('font-variant-ligatures')).toBe('');
+  });
+
+  it('is idempotent: second apply does not overwrite the stashed original', () => {
+    const el = document.createElement('textarea');
+    el.style.setProperty('font-family', 'Helvetica', '');
+    document.body.appendChild(el);
+
+    applyMonospaceFont(el);
+    applyMonospaceFont(el);
+    restoreFont(el);
+
+    expect(el.style.getPropertyValue('font-family')).toBe('Helvetica');
+  });
+
+  it('restoreFont is a no-op when apply was never called', () => {
+    const el = document.createElement('textarea');
+    el.style.setProperty('font-family', 'Helvetica', '');
+    document.body.appendChild(el);
+
+    restoreFont(el);
+    expect(el.style.getPropertyValue('font-family')).toBe('Helvetica');
   });
 });

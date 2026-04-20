@@ -41,32 +41,43 @@ describe('operators', () => {
       expect(result.cursor).toBe(6);
     });
 
-    it('dd on the last line lands cursor on the new last line, first non-blank', () => {
-      // Reproduces the "teleport to end of previous line" bug: before the
-      // fix, dd on "world" left the cursor on 'o' (last char of "hello"),
-      // not at the start of "hello" like real Vim.
+    it('dd on the last line removes the preceding newline so the line is actually gone', () => {
+      // dd must remove both "world" AND the '\n' that separated it from
+      // "hello" — otherwise a dangling "hello\n" would leave the line
+      // visually deleted but the separator still there.
       const cmd: Command = { count: 1, operator: 'd', motion: null, linewise: true };
       const result = deleteOp('hello\nworld', 7, cmd, reg);
+      expect(result.text).toBe('hello');
+      // Cursor lands on the previous line (now the only line), preserving col 1.
+      expect(result.cursor).toBe(1);
+    });
+
+    it('dd on a trailing-newline last line lands on the empty trailing line', () => {
+      // The buffer "hello\nworld\n" ends with '\n' (an empty trailing line).
+      // dd on "world" removes that line; the cursor should sit on the empty
+      // trailing line, not teleport back to the last line with text.
+      const cmd: Command = { count: 1, operator: 'd', motion: null, linewise: true };
+      const result = deleteOp('hello\nworld\n', 7, cmd, reg);
       expect(result.text).toBe('hello\n');
-      expect(result.cursor).toBe(0);
+      expect(result.cursor).toBe(6);
     });
 
-    it('dd on a middle line lands cursor at first non-blank of next line', () => {
+    it('dd on a middle line preserves column on the line below', () => {
       const cmd: Command = { count: 1, operator: 'd', motion: null, linewise: true };
-      const result = deleteOp('one\n  two\nthree', 4, cmd, reg);
+      // Cursor at col 2 of "  two" (offset 6, on 't').
+      const result = deleteOp('one\n  two\nthree', 6, cmd, reg);
       expect(result.text).toBe('one\nthree');
-      // The line that replaced "  two" is "three" — cursor goes to its
-      // first non-blank, which is 't' at offset 4.
-      expect(result.cursor).toBe(4);
+      // "three" slides up; cursor stays at col 2 → offset 4 + 2.
+      expect(result.cursor).toBe(6);
     });
 
-    it('dd preserves indentation behaviour — first non-blank, not column 0', () => {
+    it('dd clamps the preserved column to the replacement line length', () => {
       const cmd: Command = { count: 1, operator: 'd', motion: null, linewise: true };
-      const result = deleteOp('one\ntwo\n    indented', 4, cmd, reg);
-      // After deleting "two", "    indented" slides up. First non-blank
-      // is 'i' — four spaces in from the line start.
-      expect(result.text).toBe('one\n    indented');
-      expect(result.cursor).toBe(8);
+      // Cursor at col 4 of "hello" (offset 4, on 'o').
+      const result = deleteOp('hello\nhi', 4, cmd, reg);
+      expect(result.text).toBe('hi');
+      // "hi" only has length 2, so the preserved column clamps to col 1.
+      expect(result.cursor).toBe(1);
     });
 
     it('d$ deletes to end of line', () => {
@@ -138,6 +149,35 @@ describe('operators', () => {
       expect(reg.get('"').text).toBe('hello\n');
       expect(reg.get('"').linewise).toBe(true);
     });
+
+    it('yy keeps the cursor at its original column (no teleport to line start)', () => {
+      // Cursor at column 3 of "hello world" — after yy it should stay at 3,
+      // not snap back to 0. Matches Vim, and prevents a disorienting jump
+      // in chat editors where yanking is a common quick action.
+      const cmd: Command = { count: 1, operator: 'y', motion: null, linewise: true };
+      const result = yankOp('hello world\nsecond', 3, cmd, reg);
+      expect(result.cursor).toBe(3);
+    });
+
+    it('yy on a non-first line keeps the column rather than jumping to line start', () => {
+      // Text "abc\ndef", cursor at 5 (mid-"def", column 1). yy should keep 5.
+      const cmd: Command = { count: 1, operator: 'y', motion: null, linewise: true };
+      const result = yankOp('abc\ndef', 5, cmd, reg);
+      expect(result.cursor).toBe(5);
+    });
+
+    it('forward character-wise yw leaves the cursor put', () => {
+      const cmd: Command = { count: 1, operator: 'y', motion: 'w', linewise: false };
+      const result = yankOp('hello world', 2, cmd, reg);
+      expect(result.cursor).toBe(2);
+    });
+
+    it('backward character-wise yank moves cursor to the start of the range', () => {
+      // yb from inside "world" yanks backward, cursor should land at start of "world".
+      const cmd: Command = { count: 1, operator: 'y', motion: 'b', linewise: false };
+      const result = yankOp('hello world', 8, cmd, reg);
+      expect(result.cursor).toBe(6);
+    });
   });
 
   describe('deleteChar (x)', () => {
@@ -186,11 +226,20 @@ describe('operators', () => {
       expect(result.cursor).toBe(4);
     });
 
-    it('pastes linewise after current line', () => {
+    it('pastes linewise after current line and lands on the last pasted char', () => {
       reg.recordYank('new\n', true);
       const result = pasteAfter('hello\nworld', 2, reg);
       expect(result.text).toBe('hello\nnew\nworld');
-      expect(result.cursor).toBe(6);
+      // Cursor lands on the 'w' of "new" — the end of the pasted text,
+      // not its start. Matches the character-wise `p` convention.
+      expect(result.cursor).toBe(8);
+    });
+
+    it('pastes linewise on the last line and lands on the last pasted char', () => {
+      reg.recordYank('new\n', true);
+      const result = pasteAfter('hello', 2, reg);
+      expect(result.text).toBe('hello\nnew');
+      expect(result.cursor).toBe(8);
     });
 
     it('no-ops with empty register', () => {

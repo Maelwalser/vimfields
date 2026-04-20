@@ -90,6 +90,17 @@ body {
   gap: 8px;
 }
 
+.section.toggle-row {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.section.toggle-row .field-label {
+  flex: 1;
+}
+
 .field-label {
   font-size: 12px;
   font-weight: 600;

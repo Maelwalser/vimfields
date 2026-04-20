@@ -3,7 +3,8 @@ import { DEFAULT_CONFIG, STORAGE_KEYS } from "./constants";
 
 async function getConfig(): Promise<VimConfig> {
   const result = await chrome.storage.sync.get(STORAGE_KEYS.config);
-  return (result[STORAGE_KEYS.config] as VimConfig) ?? { ...DEFAULT_CONFIG };
+  const stored = result[STORAGE_KEYS.config] as Partial<VimConfig> | undefined;
+  return { ...DEFAULT_CONFIG, ...(stored ?? {}) };
 }
 
 async function saveConfig(config: VimConfig): Promise<void> {

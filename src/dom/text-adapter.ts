@@ -3,6 +3,8 @@
  * input, textarea, and contenteditable elements.
  */
 
+import { MONOSPACE_FONT_STACK } from '../constants';
+
 export interface SelectionRange {
   start: number;
   end: number;
@@ -277,10 +279,33 @@ const BLOCK_TAGS = new Set([
 // Some editors render an empty block with a <br class="ProseMirror-trailingBreak">
 // (or similar) purely to give the line height. That <br> is invisible to the
 // user's cursor and counting it produces phantom newlines in getText().
+//
+// Known sentinel patterns across framework editors:
+//   • ProseMirror / Tiptap: <br class="ProseMirror-trailingBreak">
+//   • Generic: any <br data-trailing-break>
+//   • Lexical: empty <p><br></p> as structural terminator is handled by the
+//     "empty block at EOF" logic in computeTextView, not here — a Lexical
+//     <br data-lexical-linebreak> IS a real user-visible newline.
+//   • Slate: trailing <br data-slate-zero-width="z"> inside an empty block.
 function isTrailingBreakMarker(el: Element): boolean {
   if (el.tagName !== 'BR') return false;
   const cls = el.getAttribute('class') ?? '';
-  return /\btrailingBreak\b/.test(cls) || el.hasAttribute('data-trailing-break');
+  if (/\btrailingBreak\b/.test(cls)) return true;
+  if (el.hasAttribute('data-trailing-break')) return true;
+  if (el.getAttribute('data-slate-zero-width') === 'z') return true;
+  return false;
+}
+
+// Inline widgets (mentions, emoji pickers, file chips) use contenteditable="false".
+// They contribute their textContent to the visible text but must not emit block
+// boundaries — walking into them as if they were <div>s adds phantom newlines.
+function isInlineUneditableWidget(el: Element): boolean {
+  if (!(el instanceof HTMLElement)) return false;
+  const ce = el.getAttribute('contenteditable');
+  if (ce !== 'false') return false;
+  // Treat as inline only if it isn't itself a block tag. Block-tag widgets
+  // (rare, e.g. inline code blocks) still deserve their own line.
+  return !BLOCK_TAGS.has(el.tagName);
 }
 
 // Editors can smuggle line breaks into text nodes using Unicode line/paragraph
@@ -288,6 +313,13 @@ function isTrailingBreakMarker(el: Element): boolean {
 // cursor math and motions see them as line boundaries.
 function normalizeLineSeparators(s: string): string {
   return s.replace(/[\u2028\u2029]/g, '\n');
+}
+
+function isAllNewlines(s: string, start: number, end: number): boolean {
+  for (let i = start; i < end; i++) {
+    if (s[i] !== '\n') return false;
+  }
+  return end > start;
 }
 
 function isBlockElement(el: Element): boolean {
@@ -392,7 +424,8 @@ function computeTextView(root: Element): {
       return;
     }
 
-    const treatAsBlock = el !== root && isBlockElement(el);
+    const treatAsBlock =
+      el !== root && !isInlineUneditableWidget(el) && isBlockElement(el);
     const textLenBefore = text.length;
 
     if (treatAsBlock && emittedAny) {
@@ -433,10 +466,13 @@ export class ContentEditableAdapter implements TextAdapter {
   }
 
   setText(text: string): void {
-    // For framework editors (Lexical, ProseMirror, Draft, Slate) that listen
-    // to beforeinput/input to drive their internal model, execCommand
-    // ('insertText') fires the native event pipeline so the editor stays in
-    // sync. Requires focus; if anything fails we rebuild the DOM by hand.
+    // Framework editors (Lexical, ProseMirror, Draft, Slate) install
+    // beforeinput handlers that drive their internal document model. The old
+    // "selectNodeContents + execCommand('insertText', multi-line)" path was
+    // unreliable on ProseMirror (Claude) because those editors filter \n out
+    // of insertText. We use a diff: delete only the changed range, then
+    // re-insert the new content with Shift+Enter for hard breaks — each
+    // call matches the native input path those editors listen to.
     const active = document.activeElement as Node | null;
     const isFocused =
       active === this.element ||
@@ -444,24 +480,25 @@ export class ContentEditableAdapter implements TextAdapter {
 
     if (isFocused) {
       try {
-        const sel = window.getSelection();
-        if (sel) {
-          const range = document.createRange();
-          range.selectNodeContents(this.element);
-          sel.removeAllRanges();
-          sel.addRange(range);
-          if (document.execCommand('insertText', false, text)) {
-            return;
-          }
-        }
+        if (this.applyTextViaDiff(text)) return;
       } catch {
-        // fall through to manual DOM rebuild
+        // fall through
       }
+      // Focused framework editor and the diff path failed. DO NOT rebuild
+      // the DOM — ProseMirror / Lexical / Tiptap / Slate own the structure,
+      // and replacing their <p> blocks with a <br>-flattened soup wipes the
+      // user's blank-line structure and leaves the editor's internal model
+      // out of sync. Dispatch an input event so any React/Vue bindings
+      // reconcile against whatever the editor actually has, and return. On
+      // the next interaction the editor will re-normalise from its own
+      // model — strictly safer than our guessing.
+      dispatchInputEvents(this.element, null);
+      return;
     }
 
-    // Rebuild as text nodes separated by <br>. innerText's setter would do
-    // this in a real browser, but jsdom's is a no-op — doing it explicitly
-    // keeps our round-trip consistent with computeTextView() in both.
+    // Manual DOM rebuild — used in jsdom and whenever the element is not
+    // focused (e.g. the background script sets initial content into a
+    // plain contenteditable).
     while (this.element.firstChild) {
       this.element.removeChild(this.element.firstChild);
     }
@@ -476,6 +513,158 @@ export class ContentEditableAdapter implements TextAdapter {
       }
     }
     dispatchInputEvents(this.element, text);
+  }
+
+  /**
+   * Apply a new text by diffing against the current content and poking only
+   * the changed range through the editor's input pipeline. Returns true when
+   * the edit succeeded and the resulting text matches — callers that get
+   * false should fall back to a DOM rebuild.
+   */
+  private applyTextViaDiff(next: string): boolean {
+    const current = this.getText();
+    if (current === next) return true;
+
+    let prefix = 0;
+    const minLen = Math.min(current.length, next.length);
+    while (prefix < minLen && current[prefix] === next[prefix]) prefix++;
+
+    let suffix = 0;
+    while (
+      suffix < minLen - prefix &&
+      current[current.length - 1 - suffix] === next[next.length - 1 - suffix]
+    ) suffix++;
+
+    let removeStart = prefix;
+    let removeEnd = current.length - suffix;
+    const insertText = next.slice(prefix, next.length - suffix);
+
+    // Cursor-biased disambiguation for delete-only edits across consecutive
+    // '\n's. Prefix/suffix matching on "…\n\n\n\n…" can't tell which '\n' was
+    // meant — it always picks the last one — and the resulting DOM range may
+    // map both endpoints to the same ProseMirror position, causing the editor
+    // to collapse multiple adjacent empty blocks. When the removed range is
+    // entirely newlines AND the context around it is also newlines, slide the
+    // range toward the user's cursor so we select a range inside the cursor's
+    // own block.
+    if (
+      insertText.length === 0 &&
+      removeEnd > removeStart &&
+      isAllNewlines(current, removeStart, removeEnd)
+    ) {
+      const cursor = this.getCursorPosition();
+      const len = removeEnd - removeStart;
+      let runStart = removeStart;
+      while (runStart > 0 && current[runStart - 1] === '\n') runStart--;
+      let runEnd = removeEnd;
+      while (runEnd < current.length && current[runEnd] === '\n') runEnd++;
+      if (runEnd - runStart > len) {
+        // Prefer a range that contains the cursor; fall back to a range
+        // that starts at the cursor's nearest newline.
+        const clampedCursor = Math.max(runStart, Math.min(cursor, runEnd));
+        const biasedStart = Math.max(runStart, Math.min(clampedCursor, runEnd - len));
+        removeStart = biasedStart;
+        removeEnd = biasedStart + len;
+      }
+    }
+    const doc = this.element.ownerDocument;
+
+    if (removeEnd > removeStart) {
+      this.setSelectionRange(removeStart, removeEnd);
+      let deleted = false;
+      try {
+        deleted = doc.execCommand('delete');
+      } catch {
+        deleted = false;
+      }
+      if (!deleted) return false;
+    } else {
+      this.setCursorPosition(removeStart);
+    }
+
+    if (insertText.length > 0) {
+      const segments = insertText.split('\n');
+      for (let i = 0; i < segments.length; i++) {
+        if (i > 0) {
+          if (!this.insertHardBreakAtCaret()) return false;
+        }
+        if (segments[i].length > 0) {
+          let ok = false;
+          try {
+            ok = doc.execCommand('insertText', false, segments[i]);
+          } catch {
+            ok = false;
+          }
+          if (!ok) return false;
+        }
+      }
+    }
+
+    return this.getText() === next;
+  }
+
+  /**
+   * Insert a single hard break at the current caret, returning true if the
+   * editor accepted it. Escalation ladder, from most-native to most-manual:
+   *   1. document.execCommand('insertLineBreak') — Chrome's native path for
+   *      Shift+Enter. Fires a real beforeinput/input pair with inputType
+   *      'insertLineBreak', which is what ProseMirror/Lexical/Slate listen
+   *      for. Works in framework-backed contenteditables.
+   *   2. Dispatch a synthetic InputEvent('beforeinput', …) with inputType
+   *      'insertLineBreak'. Some editors (older Slate builds) subscribe to
+   *      this even from scripts.
+   *   3. Manual <br> insertion + input dispatch. Last-resort fallback for
+   *      jsdom and plain contenteditable where execCommand is a no-op.
+   *
+   * We deliberately DO NOT dispatch a synthetic Shift+Enter KeyboardEvent —
+   * framework editors check `isTrusted` and reject scripted ones, so that
+   * path was dead code on the editors it was meant to help.
+   */
+  private insertHardBreakAtCaret(): boolean {
+    const doc = this.element.ownerDocument;
+    const view = doc.defaultView;
+    const beforeLen = this.getText().length;
+
+    try {
+      if (doc.execCommand('insertLineBreak') && this.getText().length > beforeLen) {
+        return true;
+      }
+    } catch {
+      // fall through
+    }
+
+    const InputEventCtor = view?.InputEvent ?? InputEvent;
+    try {
+      const beforeInput = new InputEventCtor('beforeinput', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        inputType: 'insertLineBreak',
+        data: null,
+      });
+      // dispatchEvent returns false when a handler called preventDefault —
+      // i.e. the editor accepted and is handling the break itself.
+      const consumedByEditor = !this.element.dispatchEvent(beforeInput);
+      if (consumedByEditor && this.getText().length > beforeLen) return true;
+    } catch {
+      // fall through
+    }
+
+    const sel = view?.getSelection();
+    if (sel && sel.rangeCount > 0) {
+      const range = sel.getRangeAt(0);
+      const br = doc.createElement('br');
+      range.deleteContents();
+      range.insertNode(br);
+      const after = doc.createRange();
+      after.setStartAfter(br);
+      after.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(after);
+      dispatchInputEvents(this.element, null);
+      return true;
+    }
+    return false;
   }
 
   getCursorPosition(): number {
@@ -554,42 +743,127 @@ export class ContentEditableAdapter implements TextAdapter {
   }
 
   insertLineBreak(position: number): number {
-    // Place the selection where the break should go, then ask the browser /
-    // editor to insert a line break using the same input pipeline Shift+Enter
-    // travels through. execCommand('insertLineBreak') fires a beforeinput with
-    // inputType: 'insertLineBreak', which ProseMirror/Lexical handle via their
-    // own transaction — setText('insertText', "\n") would strip the newline.
     this.setCursorPosition(position);
-
-    const doc = this.element.ownerDocument;
-    let inserted = false;
-    try {
-      inserted = doc.execCommand('insertLineBreak');
-    } catch {
-      inserted = false;
-    }
-
-    if (!inserted) {
-      const sel = doc.defaultView?.getSelection();
-      if (sel && sel.rangeCount > 0) {
-        const range = sel.getRangeAt(0);
-        const br = doc.createElement('br');
-        range.deleteContents();
-        range.insertNode(br);
-        dispatchInputEvents(this.element, null);
-        inserted = true;
-      }
-    }
-
-    if (!inserted) return position;
-
-    // Inserting a '\n'-equivalent at `position` shifts everything after it by
-    // exactly one offset. The cursor belongs at `position + 1`. We set it
-    // explicitly instead of trusting the browser's post-insert Range, which
-    // can land in an ambiguous gap between block boundaries.
+    if (!this.insertHardBreakAtCaret()) return position;
     const after = position + 1;
     this.setCursorPosition(after);
     return after;
+  }
+
+  /**
+   * Delete the block-level ancestor of the current selection that sits as a
+   * direct child of the editor root, exactly as if the user dragged a native
+   * selection around that one `<p>` / `<div>` and pressed Backspace. Used by
+   * linewise Vim operators (`dd`, `D`, visual-line delete) to bypass the
+   * offset-based text diff, which is ambiguous across consecutive blank
+   * lines and lets ProseMirror normalisation eagerly collapse adjacent empty
+   * blocks.
+   *
+   * Returns true on success; false if no suitable block was found (e.g. the
+   * editor has no block structure, or removing this block would empty the
+   * root — deferring to the diff path is safer in that case).
+   *
+   * After a successful delete the caret is placed at the start of the
+   * nearest surviving sibling, so the subsequent `clampNormalCursor()` in
+   * content.ts lands us on a sane Normal-mode position.
+   */
+  deleteBlockAtCursor(): boolean {
+    const root = this.element;
+    const view = root.ownerDocument?.defaultView ?? window;
+    const sel = view.getSelection();
+    if (!sel || sel.rangeCount === 0) return false;
+    const range = sel.getRangeAt(0);
+
+    const block = this.findTopLevelBlock(range.startContainer);
+    if (!block) return false;
+    // Refuse to delete the only block — would empty the editor and leave
+    // the framework editor in an invalid schema state.
+    if (block.parentNode === root) {
+      let blockSiblings = 0;
+      for (const child of Array.from(root.children)) {
+        if (isBlockElement(child)) blockSiblings++;
+      }
+      if (blockSiblings <= 1) return false;
+    }
+
+    const restore = (block.previousElementSibling as HTMLElement | null) ??
+      (block.nextElementSibling as HTMLElement | null);
+
+    const doc = root.ownerDocument;
+    const blockRange = doc.createRange();
+    blockRange.selectNode(block);
+    sel.removeAllRanges();
+    sel.addRange(blockRange);
+
+    const InputEventCtor = view.InputEvent ?? InputEvent;
+    let consumedByEditor = false;
+    try {
+      const beforeInput = new InputEventCtor('beforeinput', {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        inputType: 'deleteContent',
+        data: null,
+      });
+      // dispatchEvent returns false when a handler called preventDefault —
+      // the editor is taking responsibility for the delete.
+      consumedByEditor = !root.dispatchEvent(beforeInput);
+    } catch {
+      consumedByEditor = false;
+    }
+
+    if (!consumedByEditor) {
+      // Plain contenteditable (no framework listener) — remove the node
+      // ourselves and dispatch an input event so React/Vue bindings see the
+      // change.
+      if (block.parentNode) {
+        block.parentNode.removeChild(block);
+      }
+      dispatchInputEvents(root, null);
+    }
+
+    // Place the caret at the start of a surviving sibling so Normal-mode
+    // position math finds a valid offset on the first frame. If the editor
+    // handled the delete it may have already moved the caret — we only
+    // force the position when no sibling was found (edge case).
+    if (restore && restore.isConnected) {
+      try {
+        const after = doc.createRange();
+        after.setStart(restore, 0);
+        after.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(after);
+      } catch {
+        // Restore is not a valid start container (rare) — leave the
+        // editor's own caret wherever it landed.
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Walk up from `node` to find the nearest block element that is a direct
+   * child of this adapter's root. Returns null if no such ancestor exists
+   * (i.e. the editor has no block structure at its top level).
+   */
+  private findTopLevelBlock(node: Node): HTMLElement | null {
+    const root = this.element;
+    let current: Node | null = node;
+    // If the selection is anchored on the root itself with an offset, pick
+    // the child at that index.
+    if (current === root && node.nodeType === Node.ELEMENT_NODE) {
+      return null;
+    }
+    while (current && current !== root) {
+      const parent: Node | null = current.parentNode;
+      if (parent === root && current.nodeType === Node.ELEMENT_NODE) {
+        const el = current as HTMLElement;
+        if (isBlockElement(el)) return el;
+        return null;
+      }
+      current = parent;
+    }
+    return null;
   }
 
   dispose(): void {
@@ -768,4 +1042,50 @@ export function createTextAdapter(element: HTMLElement): TextAdapter | null {
   }
 
   return null;
+}
+
+// ── Monospace font override ────────────────────────────────────────
+
+interface FontStash {
+  fontFamily: string;
+  fontFamilyPriority: string;
+  fontVariantLigatures: string;
+  fontVariantLigaturesPriority: string;
+  fontFeatureSettings: string;
+  fontFeatureSettingsPriority: string;
+}
+
+const fontStash = new WeakMap<HTMLElement, FontStash>();
+
+export function applyMonospaceFont(element: HTMLElement): void {
+  if (!fontStash.has(element)) {
+    fontStash.set(element, {
+      fontFamily: element.style.getPropertyValue('font-family'),
+      fontFamilyPriority: element.style.getPropertyPriority('font-family'),
+      fontVariantLigatures: element.style.getPropertyValue('font-variant-ligatures'),
+      fontVariantLigaturesPriority: element.style.getPropertyPriority('font-variant-ligatures'),
+      fontFeatureSettings: element.style.getPropertyValue('font-feature-settings'),
+      fontFeatureSettingsPriority: element.style.getPropertyPriority('font-feature-settings'),
+    });
+  }
+  element.style.setProperty('font-family', MONOSPACE_FONT_STACK, 'important');
+  element.style.setProperty('font-variant-ligatures', 'none', 'important');
+  element.style.setProperty('font-feature-settings', 'normal', 'important');
+}
+
+export function restoreFont(element: HTMLElement): void {
+  const stash = fontStash.get(element);
+  if (!stash) return;
+  fontStash.delete(element);
+
+  const restore = (prop: string, value: string, priority: string) => {
+    if (value === '') {
+      element.style.removeProperty(prop);
+    } else {
+      element.style.setProperty(prop, value, priority);
+    }
+  };
+  restore('font-family', stash.fontFamily, stash.fontFamilyPriority);
+  restore('font-variant-ligatures', stash.fontVariantLigatures, stash.fontVariantLigaturesPriority);
+  restore('font-feature-settings', stash.fontFeatureSettings, stash.fontFeatureSettingsPriority);
 }

@@ -8,7 +8,13 @@
 import { MessageType, type ExtensionMessage, type VimConfig } from './types';
 import { DEFAULT_CONFIG } from './constants';
 import { FieldDetector } from './dom/field-detector';
-import { createTextAdapter, type TextAdapter } from './dom/text-adapter';
+import {
+  createTextAdapter,
+  ContentEditableAdapter,
+  applyMonospaceFont,
+  restoreFont,
+  type TextAdapter,
+} from './dom/text-adapter';
 import { CursorRenderer } from './dom/cursor-renderer';
 import { StatusBar } from './dom/status-bar';
 import { isHostDisabled } from './dom/site-matcher';
@@ -212,6 +218,10 @@ function onFieldFocus(element: HTMLElement): void {
   activeAdapter = adapter;
   activeElement = element;
 
+  if (config.useMonospaceFont) {
+    applyMonospaceFont(element);
+  }
+
   // Always start in insert mode on focus (user was already typing)
   modeManager.enterInsert();
   const mode = toRendererMode(modeManager.mode);
@@ -224,7 +234,8 @@ function onFieldFocus(element: HTMLElement): void {
   visualBuffer = '';
 }
 
-function onFieldBlur(_element: HTMLElement): void {
+function onFieldBlur(element: HTMLElement): void {
+  restoreFont(element);
   cursorRenderer.detach();
   statusBar.detach();
   activeAdapter = null;
@@ -237,6 +248,14 @@ function onFieldBlur(_element: HTMLElement): void {
 // ── Key handling ───────────────────────────────────────────────────
 
 function handleKeyDown(e: KeyboardEvent): void {
+  // Synthetic events (e.g. any InputEvent/KeyboardEvent we dispatch from the
+  // text adapter) must pass through untouched so the target editor's own
+  // handler can process them.
+  if (!e.isTrusted) return;
+  // IME composition: CJK and accented-input sequences deliver intermediate
+  // keystrokes that must reach the browser's composition pipeline. Chrome
+  // reports keyCode 229 during composition; isComposing covers the rest.
+  if (e.isComposing || e.keyCode === 229) return;
   if (!config.enabled || isSiteDisabled()) return;
   if (!activeAdapter || !activeElement) return;
 
@@ -348,12 +367,9 @@ function exitInsertMode(): void {
   statusBar.setMode(mode);
   parser.reset();
 
-  // Move cursor one left (Vim behavior)
+  // Keep the cursor where the user left it — only clamp if it's past the end
+  // or sitting on a trailing newline so Normal-mode invariants hold.
   if (activeAdapter) {
-    const pos = activeAdapter.getCursorPosition();
-    if (pos > 0) {
-      activeAdapter.setCursorPosition(pos - 1);
-    }
     clampNormalCursor();
     cursorRenderer.update();
   }
@@ -700,9 +716,22 @@ function processParseResult(result: ParseResult): void {
       // Operator + motion / text object
       pushUndo(activeElement, text);
       let edit;
+      let handledViaBlock = false;
       switch (cmd.operator) {
         case 'd':
           edit = deleteOp(text, cursor, cmd, registers);
+          // Fast path: linewise `dd` (no count) on a framework contenteditable.
+          // Targets the exact <p>/<div> block under the cursor via DOM so
+          // adjacent blank lines aren't collapsed by ProseMirror normalisation.
+          if (
+            cmd.linewise &&
+            (cmd.count ?? 1) === 1 &&
+            activeAdapter instanceof ContentEditableAdapter
+          ) {
+            if (activeAdapter.deleteBlockAtCursor()) {
+              handledViaBlock = true;
+            }
+          }
           break;
         case 'c':
           edit = changeOp(text, cursor, cmd, registers);
@@ -724,10 +753,12 @@ function processParseResult(result: ParseResult): void {
           return;
       }
 
-      if (edit.text !== text) {
-        activeAdapter.setText(edit.text);
+      if (!handledViaBlock) {
+        if (edit.text !== text) {
+          activeAdapter.setText(edit.text);
+        }
+        activeAdapter.setCursorPosition(edit.cursor);
       }
-      activeAdapter.setCursorPosition(edit.cursor);
 
       if (edit.enterInsert) {
         modeManager.enterInsert();
@@ -992,6 +1023,7 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage) => {
       const payload = message.payload as { enabled: boolean };
       config = { ...config, enabled: payload.enabled };
       if (!payload.enabled) {
+        if (activeElement) restoreFont(activeElement);
         cursorRenderer.detach();
         statusBar.detach();
         activeAdapter = null;
@@ -1002,10 +1034,17 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage) => {
     case MessageType.ConfigUpdated: {
       config = message.payload as VimConfig;
       if (!config.enabled || isSiteDisabled()) {
+        if (activeElement) restoreFont(activeElement);
         cursorRenderer.detach();
         statusBar.detach();
         activeAdapter = null;
         activeElement = null;
+      } else if (activeElement) {
+        if (config.useMonospaceFont) {
+          applyMonospaceFont(activeElement);
+        } else {
+          restoreFont(activeElement);
+        }
       }
       break;
     }

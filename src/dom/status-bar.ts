@@ -139,25 +139,23 @@ function getInlineStyles(): string {
   margin: 0;
   padding: 0;
   border: 0;
-  background: rgb(120, 170, 255);
-  color: #0b1220;
+  background: rgba(120, 170, 255, 0.35);
+  backdrop-filter: invert(1);
+  -webkit-backdrop-filter: invert(1);
   border-radius: 1px;
   overflow: hidden;
-  white-space: pre;
-  text-align: left;
-  text-indent: 0;
-  vertical-align: baseline;
   transition: left 40ms linear, top 40ms linear,
-              width 40ms linear, height 40ms linear;
+              height 40ms linear;
 }
 
 .vimfields-block-cursor[data-mode="visual"] {
-  background: rgb(196, 166, 245);
-  color: #1a0b2e;
+  background: rgba(196, 166, 245, 0.4);
 }
 
 .vimfields-block-cursor[data-mode="insert"] {
-  color: transparent;
+  background: rgb(120, 170, 255);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   animation: vimfields-cursor-blink 1.06s steps(2, end) infinite;
 }
 

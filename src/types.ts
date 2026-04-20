@@ -32,6 +32,7 @@ export interface VimConfig {
   enabled: boolean;
   escapeRemap: string;
   disabledSites: string[];
+  useMonospaceFont: boolean;
 }
 
 export interface FieldInfo {

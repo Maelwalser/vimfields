@@ -19,7 +19,11 @@ export const DEFAULT_CONFIG: VimConfig = {
   enabled: true,
   escapeRemap: "jk",
   disabledSites: [],
+  useMonospaceFont: true,
 };
+
+export const MONOSPACE_FONT_STACK =
+  '"JetBrains Mono", "Fira Code", "SF Mono", "Menlo", "Monaco", "Consolas", "Liberation Mono", monospace';
 
 export const STORAGE_KEYS = {
   config: "vimfields-config",

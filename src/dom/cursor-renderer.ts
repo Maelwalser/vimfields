@@ -203,43 +203,18 @@ export class CursorRenderer {
     this.cursorEl.style.height = `${caret.height}px`;
     this.cursorEl.dataset.mode = this.mode;
 
+    this.cursorEl.textContent = '';
     if (this.mode === 'insert') {
       // Thin blinking I-beam. Animation lives in the stylesheet.
       this.cursorEl.style.width = '2px';
-      this.cursorEl.textContent = '';
     } else {
-      // Opaque block. Render the character under the cursor inside the
-      // overlay so it stays readable against the solid background.
-      this.cursorEl.style.width = `${caret.charWidth}px`;
-      this.syncFontToField(caret.height);
-      const text = this.adapter.getText();
-      const ch = pos < text.length ? text[pos] : '';
-      this.cursorEl.textContent = ch && ch !== '\n' ? ch : '';
+      // Fixed cell width (nvim-style): use the font's "X" advance so the
+      // block doesn't wiggle between narrow and wide glyphs. The solid
+      // block inverts the pixels behind it via CSS `backdrop-filter`, so
+      // the underlying glyph stays readable without being redrawn — which
+      // avoids the baseline drift from double-rendering the character.
+      this.cursorEl.style.width = `${measureOneChar(this.adapter.element)}px`;
     }
-  }
-
-  /**
-   * Copy every font/line-box property from the field so the glyph rendered
-   * inside the overlay lands at the same baseline as the underlying text.
-   * We pin line-height to the measured caret height (a pixel number) because
-   * `getComputedStyle(...).lineHeight` can return the keyword "normal" in
-   * some engines, which we cannot reliably feed back through `style`.
-   */
-  private syncFontToField(caretHeight: number): void {
-    if (!this.cursorEl || !this.adapter) return;
-    const cs = window.getComputedStyle(this.adapter.element);
-    const style = this.cursorEl.style;
-    style.fontFamily = cs.fontFamily;
-    style.fontSize = cs.fontSize;
-    style.fontWeight = cs.fontWeight;
-    style.fontStyle = cs.fontStyle;
-    style.fontVariant = cs.fontVariant;
-    style.fontStretch = cs.fontStretch;
-    style.letterSpacing = cs.letterSpacing;
-    style.wordSpacing = cs.wordSpacing;
-    style.textTransform = cs.textTransform;
-    style.textIndent = '0';
-    style.lineHeight = `${caretHeight}px`;
   }
 
   private renderSelection(): void {

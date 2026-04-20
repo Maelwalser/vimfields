@@ -15,11 +15,23 @@ export function lineEndOf(text: string, pos: number): number {
   return next === -1 ? text.length : next;
 }
 
-/** Get the full line range including the trailing newline if present */
+/**
+ * Full-line range for a linewise delete. Includes the trailing newline when
+ * one exists; when the line is the very last in the buffer AND there is a
+ * line above, include the PRECEDING newline instead so the separator
+ * disappears with the line. Without this, dd on "world" in "hello\nworld"
+ * would leave a dangling "hello\n" — the line would look undeleted.
+ */
 function fullLineRange(text: string, pos: number): [number, number] {
   const start = lineStartOf(text, pos);
   let end = lineEndOf(text, pos);
-  if (end < text.length) end++; // include the '\n'
+  if (end < text.length) {
+    end++;
+    return [start, end];
+  }
+  if (start > 0) {
+    return [start - 1, end];
+  }
   return [start, end];
 }
 
@@ -88,12 +100,12 @@ export function deleteOp(
   const newText = text.slice(0, start) + text.slice(end);
 
   if (linewise) {
-    // Vim moves the cursor to the first non-blank of the line that now
-    // occupies the deleted line's position (or the previous line if the
-    // last line was deleted). Do NOT clamp to the last char of the line
-    // above — that "teleport to end of previous line" bug is what makes
-    // dd feel unlike a real code-line delete.
-    return { text: newText, cursor: firstNonBlankAfterDelete(newText, start) };
+    // Keep the cursor on the same column as before the delete, clamped to
+    // the new current line. Vim's native behaviour jumps to first non-blank,
+    // which feels like a teleport in chat/code fields — users expect the
+    // column to persist so vertical edits stay where they were aiming.
+    const oldColumn = cursor - lineStartOf(text, cursor);
+    return { text: newText, cursor: preserveColumnAfterDelete(newText, start, oldColumn) };
   }
 
   let newCursor = start;
@@ -106,39 +118,42 @@ export function deleteOp(
 }
 
 /**
- * After a linewise delete that removed `[start, end)`, pick the cursor
- * position Vim would use:
- *   • The line at `start` if it still exists (i.e. a middle/first line was
- *     deleted) — land on its first non-blank character.
- *   • Otherwise the previous line (the last line was deleted) — same rule.
+ * After a linewise delete that removed `[rangeStart, end)`, pick a cursor
+ * position that stays on the "previous line" — the one immediately above
+ * the deletion point — even when that line has no content.
+ *
+ *   • Line at `rangeStart` still exists → land there, preserving column.
+ *   • Deleted past the end but text ends with '\n' → sit on the empty
+ *     trailing line (newText.length). This prevents the "teleport to last
+ *     line with text" behavior.
  *   • Empty buffer → 0.
  */
-function firstNonBlankAfterDelete(newText: string, deletedLineStart: number): number {
+function preserveColumnAfterDelete(
+  newText: string,
+  rangeStart: number,
+  column: number,
+): number {
   if (newText.length === 0) return 0;
 
-  let lineStart: number;
-  if (deletedLineStart < newText.length) {
-    // A line still lives at this offset — that's the "next" line after the
-    // delete, which Vim moves to.
-    lineStart = deletedLineStart;
-  } else {
-    // Deleted the last line; fall back to the new last line.
-    lineStart = lineStartOf(newText, newText.length - 1);
+  if (rangeStart >= newText.length) {
+    if (newText.endsWith('\n')) {
+      return newText.length;
+    }
+    const lineStart = lineStartOf(newText, newText.length - 1);
+    const lineLen = newText.length - lineStart;
+    if (lineLen === 0) return lineStart;
+    const col = Math.max(0, Math.min(column, lineLen - 1));
+    return lineStart + col;
   }
 
-  let pos = lineStart;
-  while (
-    pos < newText.length &&
-    newText[pos] !== '\n' &&
-    (newText[pos] === ' ' || newText[pos] === '\t')
-  ) {
-    pos++;
-  }
-  // All whitespace (or empty line) → stay at line start.
-  if (pos >= newText.length || newText[pos] === '\n') {
-    return lineStart;
-  }
-  return pos;
+  const lineStart = rangeStart;
+  let lineEnd = newText.indexOf('\n', lineStart);
+  if (lineEnd === -1) lineEnd = newText.length;
+
+  const lineLen = lineEnd - lineStart;
+  if (lineLen === 0) return lineStart;
+  const col = Math.max(0, Math.min(column, lineLen - 1));
+  return lineStart + col;
 }
 
 /** c — change (delete then enter insert) */
@@ -182,8 +197,13 @@ export function yankOp(
   const yanked = text.slice(start, end);
   registers.recordYank(yanked, linewise, register);
 
-  // Yank doesn't modify text; cursor goes to start of range
-  return { text, cursor: start };
+  // Yank doesn't modify text. For linewise yanks (yy) keep the cursor exactly
+  // where it was so it doesn't teleport to column 0 — matches Vim's actual
+  // behavior and avoids a disorienting jump in chat editors. For character-
+  // wise yanks covering a backward range, fall back to the range start so the
+  // cursor lands on the first yanked character (Vim's rule).
+  const keepCursor = linewise || start >= cursor;
+  return { text, cursor: keepCursor ? cursor : start };
 }
 
 /** x — delete character under cursor */
@@ -237,12 +257,14 @@ export function pasteAfter(
       ? content.text.endsWith('\n') ? content.text : content.text + '\n'
       : '\n' + (content.text.endsWith('\n') ? content.text.slice(0, -1) : content.text);
     const newText = text.slice(0, insertPos) + pasteText + text.slice(insertPos);
-    // Cursor goes to first character of pasted text
-    const newCursor = lineE < text.length ? insertPos : insertPos + 1;
-    return { text: newText, cursor: newCursor };
+    // Cursor lands on the last character of the pasted text (skip the
+    // trailing newline separator when the paste ends with one).
+    const pasteEnd = insertPos + pasteText.length;
+    const newCursor = pasteText.endsWith('\n') ? pasteEnd - 2 : pasteEnd - 1;
+    return { text: newText, cursor: Math.max(insertPos, newCursor) };
   }
 
-  // Character-wise paste: insert after cursor
+  // Character-wise paste: insert after cursor, land on the last pasted char.
   const insertPos = Math.min(cursor + 1, text.length);
   const newText = text.slice(0, insertPos) + content.text + text.slice(insertPos);
   return { text: newText, cursor: insertPos + content.text.length - 1 };
