@@ -45,6 +45,14 @@ export interface TextAdapter {
    */
   insertLineBreak(position: number): number;
 
+  /**
+   * Capture the field's full editable state — for undo. The returned function
+   * restores that state verbatim when called. Contenteditable fields snapshot
+   * innerHTML so blank paragraphs and hard breaks survive a u round-trip;
+   * simple inputs snapshot value + selection.
+   */
+  snapshot(): () => void;
+
   dispose(): void;
 }
 
@@ -145,6 +153,22 @@ export class InputAdapter implements TextAdapter {
 
   insertLineBreak(position: number): number {
     return position;
+  }
+
+  snapshot(): () => void {
+    const el = this.element;
+    const value = el.value;
+    const start = el.selectionStart ?? 0;
+    const end = el.selectionEnd ?? 0;
+    return () => {
+      setNativeValue(el, value);
+      try {
+        el.setSelectionRange(start, end);
+      } catch {
+        // Some input types reject selection APIs — ignore
+      }
+      dispatchInputEvents(el);
+    };
   }
 
   dispose(): void {
@@ -253,6 +277,22 @@ export class TextareaAdapter implements TextAdapter {
     this.element.setSelectionRange(after, after);
     dispatchInputEvents(this.element, '\n');
     return after;
+  }
+
+  snapshot(): () => void {
+    const el = this.element;
+    const value = el.value;
+    const start = el.selectionStart ?? 0;
+    const end = el.selectionEnd ?? 0;
+    return () => {
+      setNativeValue(el, value);
+      try {
+        el.setSelectionRange(start, end);
+      } catch {
+        // ignore
+      }
+      dispatchInputEvents(el);
+    };
   }
 
   dispose(): void {
@@ -748,6 +788,35 @@ export class ContentEditableAdapter implements TextAdapter {
     const after = position + 1;
     this.setCursorPosition(after);
     return after;
+  }
+
+  /**
+   * Snapshot captures innerHTML so blank paragraphs, hard breaks, and inline
+   * widgets (mentions, emoji chips) all survive `u`. The diff-based setText
+   * path loses that structure — framework editors like ProseMirror collapse
+   * adjacent blank blocks during normalisation — so undo must restore the
+   * raw DOM instead.
+   *
+   * Restoration is best-effort: for plain contenteditable it's exact; for
+   * framework-backed editors (ProseMirror, Lexical) the editor's internal
+   * model gets out of sync until the next user edit, at which point it
+   * re-normalises against the DOM we've put back. That's strictly better
+   * than the previous behaviour where blank lines were silently dropped.
+   */
+  snapshot(): () => void {
+    const el = this.element;
+    const html = el.innerHTML;
+    const cursor = this.getCursorPosition();
+    return () => {
+      el.innerHTML = html;
+      dispatchInputEvents(el, null);
+      try {
+        this.setCursorPosition(cursor);
+      } catch {
+        // The restored DOM might have unexpected shape (rare) — fall back
+        // to cursor at end rather than throwing out of the undo path.
+      }
+    };
   }
 
   /**

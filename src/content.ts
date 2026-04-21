@@ -47,20 +47,23 @@ const cursorRenderer = new CursorRenderer();
 const statusBar = new StatusBar();
 const fieldDetector = new FieldDetector(onFieldFound);
 
-// Undo stack per element (simple — stores full text snapshots)
-const undoStacks = new WeakMap<HTMLElement, string[]>();
+// Undo stack per element. Stores "restore functions" returned by
+// TextAdapter.snapshot() so contenteditable undo can put the full DOM
+// (blank paragraphs, inline widgets, hard breaks) back verbatim instead of
+// round-tripping through plain text and losing structure.
+const undoStacks = new WeakMap<HTMLElement, Array<() => void>>();
 
-function pushUndo(el: HTMLElement, text: string): void {
+function pushUndo(el: HTMLElement, adapter: TextAdapter): void {
   let stack = undoStacks.get(el);
   if (!stack) {
     stack = [];
     undoStacks.set(el, stack);
   }
-  stack.push(text);
+  stack.push(adapter.snapshot());
   if (stack.length > 100) stack.shift();
 }
 
-function popUndo(el: HTMLElement): string | undefined {
+function popUndo(el: HTMLElement): (() => void) | undefined {
   return undoStacks.get(el)?.pop();
 }
 
@@ -152,7 +155,7 @@ async function doPaste(after: boolean): Promise<void> {
 
   const text = adapter.getText();
   const cursor = adapter.getCursorPosition();
-  pushUndo(element, text);
+  pushUndo(element, adapter);
 
   const edit = after
     ? pasteAfter(text, cursor, registers)
@@ -207,6 +210,17 @@ function isSiteDisabled(): boolean {
 function onFieldFound(element: HTMLElement): void {
   element.addEventListener('focus', () => onFieldFocus(element));
   element.addEventListener('blur', () => onFieldBlur(element));
+
+  // Pages that autofocus their composer (Claude, ChatGPT, ...) fire the focus
+  // event before init() finishes awaiting the config load. Attach-time focus
+  // check so the user doesn't have to blur and refocus to activate Vim.
+  const root = element.getRootNode();
+  if (
+    (root instanceof Document || root instanceof ShadowRoot) &&
+    root.activeElement === element
+  ) {
+    onFieldFocus(element);
+  }
 }
 
 function onFieldFocus(element: HTMLElement): void {
@@ -375,7 +389,17 @@ function exitInsertMode(): void {
   }
 }
 
-/** In normal mode, the cursor sits ON a character, not past it. */
+/**
+ * In Normal mode the cursor sits ON a character, not past it — except for
+ * one Vim-sanctioned exception: an empty line, where the cursor sits on the
+ * terminating '\n' (or at text.length when the buffer ends with '\n').
+ *
+ * This runs after every edit and mode switch, so it's the single point that
+ * decides where an ambiguous DOM-supplied cursor lands. Getting it wrong
+ * cascades into operators: `dd` with the cursor on the previous line's last
+ * char deletes the wrong line, which is exactly the bug we saw after
+ * Enter+Escape on a framework editor's new blank paragraph.
+ */
 function clampNormalCursor(): void {
   if (!activeAdapter) return;
   const text = activeAdapter.getText();
@@ -384,11 +408,23 @@ function clampNormalCursor(): void {
     return;
   }
   const pos = activeAdapter.getCursorPosition();
+
+  // Past the end of the buffer. If the text ends in '\n' the user is on the
+  // empty trailing line (the one `o` creates) — that's a valid Vim cursor
+  // position and must NOT be collapsed back onto the previous line's last
+  // character, otherwise `dd` nukes the line above instead of the blank one.
   if (pos >= text.length) {
-    activeAdapter.setCursorPosition(text.length - 1);
+    if (text.endsWith('\n')) {
+      activeAdapter.setCursorPosition(text.length);
+    } else {
+      activeAdapter.setCursorPosition(text.length - 1);
+    }
     return;
   }
-  // If the cursor is on a trailing newline, step back onto the last char of the line
+
+  // Cursor on a '\n'. Valid only when it represents an empty line
+  // (preceding char is '\n' or there is none). On the terminator of a
+  // non-empty line, step back onto the last visible character.
   if (text[pos] === '\n' && pos > 0 && text[pos - 1] !== '\n') {
     activeAdapter.setCursorPosition(pos - 1);
   }
@@ -420,7 +456,7 @@ function handleVisualKey(key: string): void {
     const text = activeAdapter.getText();
     const cursor = activeAdapter.getCursorPosition();
     const isLinewise = modeManager.mode === VimModeEnum.VisualLine;
-    pushUndo(activeElement, text);
+    pushUndo(activeElement, activeAdapter);
     const mode = key === 'u' ? 'lower' : key === 'U' ? 'upper' : 'toggle';
     const edit = caseSelection(text, visualAnchor, cursor, isLinewise, mode);
     activeAdapter.setText(edit.text);
@@ -441,7 +477,7 @@ function handleVisualKey(key: string): void {
       case 'x':
       case 'X':
       case 'D': {
-        pushUndo(activeElement, text);
+        pushUndo(activeElement, activeAdapter);
         const edit = deleteSelection(text, visualAnchor, cursor, isLinewise, registers);
         activeAdapter.setText(edit.text);
         activeAdapter.setCursorPosition(edit.cursor);
@@ -460,7 +496,7 @@ function handleVisualKey(key: string): void {
       case 'C':
       case 's':
       case 'S': {
-        pushUndo(activeElement, text);
+        pushUndo(activeElement, activeAdapter);
         const edit = changeSelection(text, visualAnchor, cursor, isLinewise, registers);
         activeAdapter.setText(edit.text);
         activeAdapter.setCursorPosition(edit.cursor);
@@ -472,7 +508,7 @@ function handleVisualKey(key: string): void {
       case 'u':
       case 'U':
       case '~': {
-        pushUndo(activeElement, text);
+        pushUndo(activeElement, activeAdapter);
         const mode = key === 'u' ? 'lower' : key === 'U' ? 'upper' : 'toggle';
         const edit = caseSelection(text, visualAnchor, cursor, isLinewise, mode);
         activeAdapter.setText(edit.text);
@@ -714,7 +750,7 @@ function processParseResult(result: ParseResult): void {
       clampNormalCursor();
     } else {
       // Operator + motion / text object
-      pushUndo(activeElement, text);
+      pushUndo(activeElement, activeAdapter);
       let edit;
       let handledViaBlock = false;
       switch (cmd.operator) {
@@ -845,7 +881,7 @@ function handleAction(
     }
 
     case 'o': {
-      pushUndo(activeElement, text);
+      pushUndo(activeElement, activeAdapter);
       const end = lineEndOf(text, cursor);
       const after = activeAdapter.insertLineBreak(end);
       activeAdapter.setCursorPosition(after);
@@ -855,7 +891,7 @@ function handleAction(
     }
 
     case 'O': {
-      pushUndo(activeElement, text);
+      pushUndo(activeElement, activeAdapter);
       const start = lineStartOf(text, cursor);
       activeAdapter.insertLineBreak(start);
       activeAdapter.setCursorPosition(start);
@@ -865,7 +901,7 @@ function handleAction(
     }
 
     case 'x': {
-      pushUndo(activeElement, text);
+      pushUndo(activeElement, activeAdapter);
       const edit = deleteChar(text, cursor, count, registers);
       activeAdapter.setText(edit.text);
       activeAdapter.setCursorPosition(edit.cursor);
@@ -875,7 +911,7 @@ function handleAction(
     }
 
     case 'X': {
-      pushUndo(activeElement, text);
+      pushUndo(activeElement, activeAdapter);
       const edit = deleteCharBefore(text, cursor, count, registers);
       if (edit.text !== text) activeAdapter.setText(edit.text);
       activeAdapter.setCursorPosition(edit.cursor);
@@ -886,7 +922,7 @@ function handleAction(
 
     case 'D': {
       // Delete to end of line (= d$)
-      pushUndo(activeElement, text);
+      pushUndo(activeElement, activeAdapter);
       const cmd: Command = { count: 1, operator: 'd', motion: '$', linewise: false };
       const edit = deleteOp(text, cursor, cmd, registers);
       activeAdapter.setText(edit.text);
@@ -898,7 +934,7 @@ function handleAction(
 
     case 'C': {
       // Change to end of line (= c$)
-      pushUndo(activeElement, text);
+      pushUndo(activeElement, activeAdapter);
       const cmd: Command = { count: 1, operator: 'c', motion: '$', linewise: false };
       const edit = changeOp(text, cursor, cmd, registers);
       activeAdapter.setText(edit.text);
@@ -918,7 +954,7 @@ function handleAction(
 
     case 's': {
       // Substitute: delete `count` chars then enter insert
-      pushUndo(activeElement, text);
+      pushUndo(activeElement, activeAdapter);
       const edit = deleteChar(text, cursor, count, registers);
       activeAdapter.setText(edit.text);
       activeAdapter.setCursorPosition(edit.cursor);
@@ -929,7 +965,7 @@ function handleAction(
 
     case 'S': {
       // Substitute line: equivalent to cc
-      pushUndo(activeElement, text);
+      pushUndo(activeElement, activeAdapter);
       const cmd: Command = { count, operator: 'c', motion: null, linewise: true };
       const edit = changeOp(text, cursor, cmd, registers);
       activeAdapter.setText(edit.text);
@@ -940,7 +976,7 @@ function handleAction(
     }
 
     case '~': {
-      pushUndo(activeElement, text);
+      pushUndo(activeElement, activeAdapter);
       const edit = toggleCaseChar(text, cursor, count);
       if (edit.text !== text) activeAdapter.setText(edit.text);
       activeAdapter.setCursorPosition(edit.cursor);
@@ -951,7 +987,7 @@ function handleAction(
 
     case 'r': {
       if (charArg) {
-        pushUndo(activeElement, text);
+        pushUndo(activeElement, activeAdapter);
         const edit = replaceChar(text, cursor, charArg);
         activeAdapter.setText(edit.text);
         activeAdapter.setCursorPosition(edit.cursor);
@@ -969,7 +1005,7 @@ function handleAction(
       break;
 
     case 'J': {
-      pushUndo(activeElement, text);
+      pushUndo(activeElement, activeAdapter);
       const edit = joinLines(text, cursor);
       activeAdapter.setText(edit.text);
       activeAdapter.setCursorPosition(edit.cursor);
@@ -979,10 +1015,10 @@ function handleAction(
     }
 
     case 'u': {
-      const prev = popUndo(activeElement);
-      if (prev !== undefined) {
-        activeAdapter.setText(prev);
-        activeAdapter.setCursorPosition(Math.min(cursor, Math.max(0, prev.length - 1)));
+      const restore = popUndo(activeElement);
+      if (restore) {
+        restore();
+        clampNormalCursor();
         cursorRenderer.update();
       }
       break;

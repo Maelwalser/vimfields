@@ -880,3 +880,85 @@ describe('applyMonospaceFont / restoreFont', () => {
     expect(el.style.getPropertyValue('font-family')).toBe('Helvetica');
   });
 });
+
+// ---------------------------------------------------------------------------
+// snapshot() — undo must restore rich structure verbatim. The plain-text
+// round-trip path was losing blank paragraphs because the diff-based setText
+// collapses adjacent empty blocks during framework-editor normalisation.
+// ---------------------------------------------------------------------------
+
+describe('TextAdapter.snapshot', () => {
+  it('ContentEditableAdapter restores blank paragraphs between text blocks', () => {
+    const div = document.createElement('div');
+    div.contentEditable = 'true';
+    div.innerHTML = '<p>first</p><p><br></p><p>third</p>';
+    document.body.appendChild(div);
+    const adapter = new ContentEditableAdapter(div);
+
+    const restore = adapter.snapshot();
+
+    // Simulate an edit that would collapse the blank paragraph if we only
+    // tracked plain text (the diff setText path does this).
+    div.innerHTML = '<p>first</p><p>third</p>';
+    expect(adapter.getText()).toBe('first\nthird');
+
+    restore();
+    // Exact DOM structure is what we care about — plain-text view derived from
+    // <p><br></p> varies by walker heuristics, but the restored HTML must be
+    // byte-for-byte identical so framework editors can re-normalise from it.
+    expect(div.innerHTML).toBe('<p>first</p><p><br></p><p>third</p>');
+  });
+
+  it('ContentEditableAdapter restores the exact cursor position', () => {
+    const div = document.createElement('div');
+    div.contentEditable = 'true';
+    div.innerHTML = '<p>hello</p><p>world</p>';
+    document.body.appendChild(div);
+    const adapter = new ContentEditableAdapter(div);
+    // Cursor at start of "world" — offset 6.
+    adapter.setCursorPosition(6);
+    const restore = adapter.snapshot();
+
+    // Mutate — simulate any operator.
+    div.innerHTML = '<p>hello</p>';
+    adapter.setCursorPosition(0);
+
+    restore();
+    expect(adapter.getCursorPosition()).toBe(6);
+  });
+
+  it('TextareaAdapter restores value and selection', () => {
+    const ta = document.createElement('textarea');
+    document.body.appendChild(ta);
+    const adapter = new TextareaAdapter(ta);
+    adapter.setText('line1\n\nline3');
+    ta.setSelectionRange(6, 6);
+
+    const restore = adapter.snapshot();
+
+    adapter.setText('different');
+    ta.setSelectionRange(0, 0);
+
+    restore();
+    expect(adapter.getText()).toBe('line1\n\nline3');
+    expect(adapter.getCursorPosition()).toBe(6);
+  });
+
+  it('InputAdapter restores value and selection', () => {
+    const input = document.createElement('input');
+    input.type = 'text';
+    document.body.appendChild(input);
+    const adapter = new InputAdapter(input);
+    adapter.setText('original');
+    input.setSelectionRange(3, 3);
+
+    const restore = adapter.snapshot();
+
+    adapter.setText('replaced');
+    input.setSelectionRange(0, 0);
+
+    restore();
+    expect(adapter.getText()).toBe('original');
+    expect(adapter.getCursorPosition()).toBe(3);
+  });
+});

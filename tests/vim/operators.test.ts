@@ -62,6 +62,26 @@ describe('operators', () => {
       expect(result.cursor).toBe(6);
     });
 
+    it('dd on an empty trailing line removes just the separator', () => {
+      // After Enter+Escape on a new blank line in a framework editor, text is
+      // "hello\n" and the cursor sits at offset 6 (the implicit empty line).
+      // dd there must delete the blank line, not the line above.
+      const cmd: Command = { count: 1, operator: 'd', motion: null, linewise: true };
+      const result = deleteOp('hello\n', 6, cmd, reg);
+      expect(result.text).toBe('hello');
+      expect(result.cursor).toBe(0);
+    });
+
+    it('dd on the first character of a middle line deletes that line', () => {
+      // Regression: when cursor is at col 0 of a non-first line, fullLineRange
+      // must anchor to the CURRENT line start, not the previous line's '\n'.
+      const cmd: Command = { count: 1, operator: 'd', motion: null, linewise: true };
+      // Offset 6 is the 'l' of "line2" in "line1\nline2\nline3".
+      const result = deleteOp('line1\nline2\nline3', 6, cmd, reg);
+      expect(result.text).toBe('line1\nline3');
+      expect(result.cursor).toBe(6);
+    });
+
     it('dd on a middle line preserves column on the line below', () => {
       const cmd: Command = { count: 1, operator: 'd', motion: null, linewise: true };
       // Cursor at col 2 of "  two" (offset 6, on 't').
